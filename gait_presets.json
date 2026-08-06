@@ -1,0 +1,126 @@
+{
+  "format": "hanachan-gait-presets",
+  "version": 1,
+  "presets": [
+    {
+      "name": "osii",
+      "gait_params": [
+        -0.789474,
+        0.181818,
+        0.0,
+        0.59,
+        -0.9,
+        0.2,
+        0.94,
+        0.0,
+        -0.34,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        -1.0,
+        0.0,
+        0.22
+      ],
+      "sweep_phase_offset_rad": 0.0,
+      "reverse_legs": false,
+      "gait_model": "v2"
+    },
+    {
+      "name": "osii1",
+      "gait_params": [
+        -0.789474,
+        0.181818,
+        0.0,
+        0.59,
+        -0.9,
+        0.2,
+        0.94,
+        0.0,
+        -0.34,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        -1.0,
+        0.0,
+        0.22
+      ],
+      "sweep_phase_offset_rad": 0.0,
+      "reverse_legs": false,
+      "gait_model": "v2"
+    },
+    {
+      "name": "back",
+      "gait_params": [
+        -1.0,
+        0.181818,
+        0.0,
+        0.59,
+        -0.9,
+        0.2,
+        0.6,
+        0.0,
+        -0.34,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        -1.0,
+        0.0,
+        0.22
+      ],
+      "sweep_phase_offset_rad": 0.0,
+      "reverse_legs": true,
+      "gait_model": "v2"
+    },
+    {
+      "name": "moonwalk",
+      "gait_params": [
+        -1.0,
+        0.181818,
+        0.0,
+        0.61,
+        -0.9,
+        0.2,
+        0.6,
+        0.0,
+        -0.18,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        -1.0,
+        0.0,
+        0.22
+      ],
+      "sweep_phase_offset_rad": 0.0,
+      "reverse_legs": true,
+      "gait_model": "v2"
+    },
+    {
+      "name": "moonwalk_front",
+      "gait_params": [
+        -1.0,
+        0.181818,
+        0.0,
+        0.61,
+        -0.9,
+        0.2,
+        1.0,
+        -0.64,
+        0.47,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        -1.0,
+        0.0,
+        0.22
+      ],
+      "sweep_phase_offset_rad": 0.0,
+      "reverse_legs": true,
+      "gait_model": "v2"
+    }
+  ]
+}
