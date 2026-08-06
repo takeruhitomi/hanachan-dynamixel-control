@@ -35,6 +35,7 @@ DEFAULT_DISCOVERY_PROTOCOLS = (2.0, 1.0)
 DEFAULT_POSITION_MIN = 0
 DEFAULT_POSITION_MAX = 4095
 DEFAULT_TEST_DELTA = 20
+DEFAULT_CONFIG_PATH = "robot_config.json"
 WIRELESS_RETRY_ATTEMPTS = 5
 WIRELESS_RETRY_DELAY_SECONDS = 0.01
 WIRELESS_MINIMUM_PACKET_TIMEOUT_MS = 120.0
@@ -43,7 +44,7 @@ POSITION_CONTROL_MODE = 3
 TABLE = ControlTable()
 
 SERVO_COUNT = 28
-PARAM_COUNT = 12
+PARAM_COUNT = 12  # v1 gait model; see GaitModel.param_count for per-model counts
 LEG_COUNT = 8
 BODY_COUNT = 3
 PI_F = math.pi
@@ -192,6 +193,114 @@ GAIT_PARAM_DESCRIPTIONS = [
     "胴体関節間の位相差。胴体を伝わる波の向きと形を変える。",
 ]
 
+# v2 drives yaw and lift from one shared fore-aft stroke, and couples the knee
+# against the hip so the foot keeps its angle to the ground while the leg swings.
+GAIT_PARAM_SPECS_V2 = [
+    ("Frequency", "Hz", 0.25, 1.20),
+    ("Stride", "", -0.55, 0.55),
+    ("Stride bias", "", -0.20, 0.20),
+    ("Leg swing", "", -0.55, 0.55),
+    ("Foot level", "", -1.50, 1.50),
+    ("Foot clearance", "", -0.50, 0.50),
+    ("Stance duty", "", 0.35, 0.75),
+    ("Knee bias", "", -0.35, 0.35),
+    ("Lift bias", "", -0.35, 0.35),
+    ("Turn", "", -1.00, 1.00),
+    ("Segment phase", "rad", -PI_F, PI_F),
+    ("Left/right phase", "rad", 0.45 * PI_F, 1.35 * PI_F),
+    ("Body wave", "", 0.00, 0.38),
+    ("Body phase", "rad", -PI_F, PI_F),
+    ("Body turn", "", -0.35, 0.35),
+    ("Knee phase", "rad", -PI_F, PI_F),
+]
+GAIT_PARAM_DESCRIPTIONS_V2 = [
+    "歩行周期の速さ。全関節のCPG位相が進む速度を変える。",
+    "yawの前後振幅。水平面内での歩幅を決める。負にするとlift/kneeに対して前後が反転する。",
+    "yawの固定オフセット。足を置く前後中心位置をずらす。",
+    "liftの前後振幅。yawと同位相で脚全体を前後に振る量。負でlift/kneeがまとめて反転する。",
+    "膝とliftの連動係数。1.0でliftの回転を膝が打ち消し、足裏が地面と平行に保たれる。",
+    "遊脚中だけliftに加算される持ち上げ量。接地を避けるクリアランス。持ち上げ向きが逆なら負にする。",
+    "1周期に占める接地期の割合。大きいほど蹴っている時間が長い。",
+    "膝の固定オフセット。立脚時を含む基本の膝曲げ量を変える。",
+    "liftの固定オフセット。基本姿勢の高さ・接地圧をずらす。",
+    "左右のStride差。正で左脚の歩幅が伸び、右へ旋回する。",
+    "前後セグメント間の脚位相差。π付近では隣接脚群が交互になる。",
+    "左脚群と右脚群の位相差。π付近では左右が交互になる。",
+    "胴体関節ID 1〜3の周期的な曲げ振幅。",
+    "胴体関節間の位相差。胴体を伝わる波の向きと形を変える。",
+    "胴体関節ID 1〜3を同じ向きに曲げる固定量。旋回に使う。",
+    "膝がliftから遅れる位相。足裏が地面と平行にならないときの追従タイミング補正。",
+]
+SAFE_GAIT_PARAMS_V2 = [
+    -0.789474,
+    0.181818,
+    0.000000,
+    0.181818,
+    0.666667,
+    0.200000,
+    0.000000,
+    0.000000,
+    0.000000,
+    0.000000,
+    1.000000,
+    0.222222,
+    -0.736842,
+    0.652535,
+    0.000000,
+    0.000000,
+]
+FORWARD_GAIT_PARAMS_V2 = [
+    -0.052632,
+    0.545455,
+    0.000000,
+    0.509091,
+    0.666667,
+    0.440000,
+    0.250000,
+    0.000000,
+    0.000000,
+    0.000000,
+    1.000000,
+    0.222222,
+    -0.210526,
+    0.652535,
+    0.000000,
+    0.000000,
+]
+@dataclass(frozen=True)
+class GaitModel:
+    name: str
+    specs: list
+    descriptions: list
+    safe_params: list
+    forward_params: list
+    config_key: str
+
+    @property
+    def param_count(self) -> int:
+        return len(self.specs)
+
+
+GAIT_MODELS = {
+    "v1": GaitModel(
+        name="v1",
+        specs=GAIT_PARAM_SPECS,
+        descriptions=GAIT_PARAM_DESCRIPTIONS,
+        safe_params=SAFE_GAIT_PARAMS,
+        forward_params=FORWARD_GAIT_PARAMS,
+        config_key="gait_params",
+    ),
+    "v2": GaitModel(
+        name="v2",
+        specs=GAIT_PARAM_SPECS_V2,
+        descriptions=GAIT_PARAM_DESCRIPTIONS_V2,
+        safe_params=SAFE_GAIT_PARAMS_V2,
+        forward_params=FORWARD_GAIT_PARAMS_V2,
+        config_key="gait_params_v2",
+    ),
+}
+DEFAULT_GAIT_MODEL = "v1"
+
 
 @dataclass(frozen=True)
 class LegMap:
@@ -223,9 +332,14 @@ class RobotConfig:
     joint_lower: list[float]
     joint_upper: list[float]
     gait_params: list[float]
+    gait_params_v2: list[float]
     enabled_indices: list[int]
     reverse_legs: bool
     sweep_phase_offset_rad: float
+
+    def params_for(self, gait_model: str) -> list[float]:
+        """Return the live parameter list for one gait model; mutations stick."""
+        return self.gait_params_v2 if gait_model == "v2" else self.gait_params
 
 
 MOTION_SEQUENCE_FORMAT = "hanachan-motion-sequence"
@@ -255,6 +369,8 @@ class GaitPreset:
     gait_params: list[float]
     sweep_phase_offset_rad: float = 0.0
     reverse_legs: bool = False
+    # Untagged presets predate the v2 model, so they can only be v1 values.
+    gait_model: str = "v1"
 
 
 @dataclass
@@ -274,7 +390,20 @@ class LegMotionDesign:
     phase_offsets: list[float]
 
 
+def describe_ports() -> dict[str, str]:
+    """Map serial device name to a human readable description when available."""
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return {}
+    return {port.device: (port.description or "").strip() for port in list_ports.comports()}
+
+
 def candidate_ports() -> list[str]:
+    if sys.platform.startswith("win"):
+        # COM ports are not filesystem entries, so globbing never finds them.
+        return sorted(describe_ports())
+
     patterns = (
         "/dev/cu.usbmodem*",
         "/dev/cu.usbserial*",
@@ -282,7 +411,6 @@ def candidate_ports() -> list[str]:
         "/dev/tty.usbserial*",
         "/dev/ttyACM*",
         "/dev/ttyUSB*",
-        "COM*",
     )
     ports: list[str] = []
     for pattern in patterns:
@@ -364,9 +492,13 @@ def parse_int_overrides(value: str) -> dict[int, int]:
 
 
 def parse_float_params(value: str) -> list[float]:
+    # The gait model is not known at parse time, so accept any model's length
+    # here; validate_robot_config rejects a count that does not match the model.
     values = parse_float_list(value)
-    if len(values) != PARAM_COUNT:
-        raise argparse.ArgumentTypeError(f"gait params must contain {PARAM_COUNT} values")
+    allowed = sorted({model.param_count for model in GAIT_MODELS.values()})
+    if len(values) not in allowed:
+        expected = " or ".join(str(count) for count in allowed)
+        raise argparse.ArgumentTypeError(f"gait params must contain {expected} values")
     return values
 
 
@@ -391,6 +523,7 @@ def default_robot_config(layout: str = "three-segment") -> RobotConfig:
         joint_lower=list(JOINT_LOWER),
         joint_upper=list(JOINT_UPPER),
         gait_params=list(DEFAULT_GAIT_PARAMS),
+        gait_params_v2=list(SAFE_GAIT_PARAMS_V2),
         enabled_indices=enabled_indices_for_layout(layout),
         reverse_legs=False,
         sweep_phase_offset_rad=0.0,
@@ -400,6 +533,9 @@ def default_robot_config(layout: str = "three-segment") -> RobotConfig:
 def load_robot_config(path: str | None, layout: str = "three-segment") -> RobotConfig:
     config = default_robot_config(layout)
     if path is None:
+        return config
+    if path == DEFAULT_CONFIG_PATH and not Path(path).exists():
+        # The default config is optional; an explicit --config path is not.
         return config
 
     with open(path, "r", encoding="utf-8") as f:
@@ -417,6 +553,8 @@ def load_robot_config(path: str | None, layout: str = "three-segment") -> RobotC
         config.joint_upper = [float(value) for value in data["joint_upper"]]
     if "gait_params" in data:
         config.gait_params = [float(value) for value in data["gait_params"]]
+    if "gait_params_v2" in data:
+        config.gait_params_v2 = [float(value) for value in data["gait_params_v2"]]
     if "enabled_indices" in data:
         config.enabled_indices = [int(value) for value in data["enabled_indices"]]
     if "reverse_legs" in data:
@@ -434,7 +572,8 @@ def validate_robot_config(config: RobotConfig) -> None:
     require_length("directions", config.directions, SERVO_COUNT)
     require_length("joint_lower", config.joint_lower, SERVO_COUNT)
     require_length("joint_upper", config.joint_upper, SERVO_COUNT)
-    require_length("gait_params", config.gait_params, PARAM_COUNT)
+    require_length("gait_params", config.gait_params, GAIT_MODELS["v1"].param_count)
+    require_length("gait_params_v2", config.gait_params_v2, GAIT_MODELS["v2"].param_count)
     if not isinstance(config.reverse_legs, bool):
         raise ValueError("reverse_legs must be true or false")
     if (
@@ -578,7 +717,13 @@ def interpolate_positions(
 def validate_gait_preset(preset: GaitPreset) -> None:
     if not preset.name.strip():
         raise ValueError("gait preset name must not be empty")
-    require_length("gait preset params", preset.gait_params, PARAM_COUNT)
+    if preset.gait_model not in GAIT_MODELS:
+        raise ValueError(f"unknown gait preset model: {preset.gait_model}")
+    require_length(
+        "gait preset params",
+        preset.gait_params,
+        GAIT_MODELS[preset.gait_model].param_count,
+    )
     for value in preset.gait_params:
         if not math.isfinite(value) or value < -1.0 or value > 1.0:
             raise ValueError("gait preset params must be finite values between -1 and 1")
@@ -620,6 +765,7 @@ def load_gait_presets(path: str) -> list[GaitPreset]:
             gait_params=[float(value) for value in params],
             sweep_phase_offset_rad=float(raw.get("sweep_phase_offset_rad", 0.0)),
             reverse_legs=raw.get("reverse_legs", False),
+            gait_model=str(raw.get("gait_model", "v1")),
         )
         validate_gait_preset(preset)
         if preset.name in seen_names:
@@ -645,6 +791,7 @@ def save_gait_presets(path: str, presets: list[GaitPreset]) -> None:
                 "gait_params": preset.gait_params,
                 "sweep_phase_offset_rad": preset.sweep_phase_offset_rad,
                 "reverse_legs": preset.reverse_legs,
+                "gait_model": preset.gait_model,
             }
             for preset in presets
         ],
@@ -946,6 +1093,7 @@ def apply_robot_overrides(
     gait_params: list[float] | None = None,
     zero_overrides: dict[int, int] | None = None,
     direction_overrides: dict[int, int] | None = None,
+    gait_model: str = DEFAULT_GAIT_MODEL,
 ) -> RobotConfig:
     if ids is not None:
         config.ids = ids
@@ -954,7 +1102,7 @@ def apply_robot_overrides(
     if directions is not None:
         config.directions = directions
     if gait_params is not None:
-        config.gait_params = gait_params
+        config.params_for(gait_model)[:] = gait_params
     if zero_overrides:
         id_to_index = {dxl_id: index for index, dxl_id in enumerate(config.ids)}
         for dxl_id, zero_tick in zero_overrides.items():
@@ -969,6 +1117,21 @@ def apply_robot_overrides(
             config.directions[id_to_index[dxl_id]] = direction
     validate_robot_config(config)
     return config
+
+
+def gait_stroke(cycle: float, stance_duty: float) -> tuple[float, float]:
+    """Fore-aft stroke and foot rise at one point of the v2 cycle.
+
+    The stroke runs +1 (front) to -1 (rear) at constant speed while the foot is
+    on the ground, then eases back to the front. Foot rise is zero through the
+    whole stance so the foot is only lifted on the return.
+    """
+    cycle %= 1.0
+    if cycle < stance_duty:
+        progress = cycle / max(1e-6, stance_duty)
+        return 1.0 - 2.0 * progress, 0.0
+    progress = (cycle - stance_duty) / max(1e-6, 1.0 - stance_duty)
+    return -math.cos(PI_F * progress), math.sin(PI_F * progress)
 
 
 def clip_unit(value: float) -> float:
@@ -1318,10 +1481,17 @@ class OnboardHanachanCPGController:
 
 
 class HanachanCPGController:
-    def __init__(self, bus: DynamixelBus, config: RobotConfig) -> None:
+    def __init__(
+        self,
+        bus: DynamixelBus,
+        config: RobotConfig,
+        gait_model: str = DEFAULT_GAIT_MODEL,
+    ) -> None:
         self.bus = bus
         self.config = config
-        self.filtered_params = [0.0] * PARAM_COUNT
+        self.gait_model = gait_model
+        self.gait_params = config.params_for(gait_model)
+        self.filtered_params = [0.0] * GAIT_MODELS[gait_model].param_count
         self.servo_action = [0.0] * SERVO_COUNT
         self.phase_rad = 0.0
         self.motion_enabled = False
@@ -1418,11 +1588,98 @@ class HanachanCPGController:
 
     def filter_params(self, dt: float) -> None:
         alpha = dt / (ACTION_FILTER_TAU + dt)
-        for i, value in enumerate(self.config.gait_params):
+        for i, value in enumerate(self.gait_params):
             raw = clip_unit(value)
             self.filtered_params[i] += alpha * (raw - self.filtered_params[i])
 
     def compute_servo_action(self, dt: float) -> None:
+        if self.gait_model == "v2":
+            self.compute_servo_action_v2(dt)
+        else:
+            self.compute_servo_action_v1(dt)
+
+    def param(self, index: int) -> float:
+        """Filtered parameter mapped through its own spec range, never a copy of it."""
+        _name, _unit, low, high = GAIT_MODELS[self.gait_model].specs[index]
+        return map_range(self.filtered_params[index], low, high)
+
+    def compute_servo_action_v2(self, dt: float) -> None:
+        """Drive yaw and lift from one fore-aft stroke, with the knee counter-coupled.
+
+        The stroke `s` runs +1 (front) to -1 (rear) at constant speed while the foot
+        is on the ground, then swings back smoothly. `clearance` lifts the foot only
+        during that return, and `foot_level` folds the knee against the hip so the
+        foot keeps its angle to the ground through the whole stroke.
+        """
+        self.servo_action = [0.0] * SERVO_COUNT
+
+        frequency_hz = self.param(0)
+        stride = self.param(1)
+        stride_bias = self.param(2)
+        leg_swing = self.param(3)
+        foot_level = self.param(4)
+        clearance = self.param(5)
+        stance_duty = self.param(6)
+        knee_bias = self.param(7)
+        lift_bias = self.param(8)
+        turn = self.param(9)
+        segment_lag = self.param(10)
+        side_lag = self.param(11)
+        body_amp = self.param(12)
+        body_lag = self.param(13)
+        body_turn = self.param(14)
+        knee_phase = self.param(15)
+        sweep_direction = -1.0 if self.config.reverse_legs else 1.0
+
+        self.phase_rad += TWO_PI_F * frequency_hz * dt
+        while self.phase_rad >= TWO_PI_F:
+            self.phase_rad -= TWO_PI_F
+
+        # sweep_phase_offset_rad shifts yaw against lift; knee_phase delays the knee
+        # against lift, so the foot can be kept level through the whole stroke.
+        yaw_offset = self.config.sweep_phase_offset_rad / TWO_PI_F
+        knee_offset = knee_phase / TWO_PI_F
+
+        for leg in LEGS:
+            leg_phase = self.phase_rad + leg.segment_index * segment_lag + leg.side_index * side_lag
+            cycle = (leg_phase / TWO_PI_F) % 1.0
+
+            stroke, foot_rise = gait_stroke(cycle, stance_duty)
+            yaw_stroke, _ = gait_stroke(cycle + yaw_offset, stance_duty)
+            knee_stroke, knee_rise = gait_stroke(cycle - knee_offset, stance_duty)
+
+            stroke *= sweep_direction
+            yaw_stroke *= sweep_direction
+            knee_stroke *= sweep_direction
+            if self.gait_test_mode == "lift":
+                stroke = 0.0
+                yaw_stroke = 0.0
+                knee_stroke = 0.0
+            elif self.gait_test_mode == "ground":
+                foot_rise = 0.0
+                knee_rise = 0.0
+
+            # Positive turn lengthens the left stride and shortens the right one.
+            turn_gain = 1.0 + turn * (1.0 if leg.side_index == 0 else -1.0)
+            hip = leg_swing * stroke + clearance * foot_rise
+
+            self.servo_action[leg.yaw_index] = clip_unit(
+                leg.side_sign * (stride_bias + stride * turn_gain * yaw_stroke)
+            )
+            knee_hip = leg_swing * knee_stroke + clearance * knee_rise
+
+            self.servo_action[leg.lift_index] = clip_unit(-leg.side_sign * (lift_bias + hip))
+            self.servo_action[leg.knee_index] = clip_unit(
+                leg.side_sign * (knee_bias - foot_level * knee_hip)
+            )
+
+        # Body turn bends IDs 1-3 the same way to steer; the wave rides on top of it.
+        for i in range(BODY_COUNT):
+            body_phase = self.phase_rad + i * body_lag
+            body_wave = body_amp * math.sin(body_phase) if self.gait_test_mode == "full" else 0.0
+            self.servo_action[BODY_JOINT_INDEX[i]] = clip_unit(body_turn + body_wave)
+
+    def compute_servo_action_v1(self, dt: float) -> None:
         self.servo_action = [0.0] * SERVO_COUNT
 
         frequency_hz = map_range(self.filtered_params[0], 0.25, 1.20)
@@ -1460,10 +1717,10 @@ class HanachanCPGController:
 
             if self.gait_test_mode == "ground":
                 lift_action = -leg.side_sign * lift_bias
-                knee_action = knee_bias
+                knee_action = leg.side_sign * knee_bias
             else:
                 lift_action = -leg.side_sign * (lift_bias + lift_amp * swing_lift)
-                knee_action = knee_bias + knee_amp * swing_fold
+                knee_action = leg.side_sign * (knee_bias + knee_amp * swing_fold)
             self.servo_action[leg.lift_index] = clip_unit(lift_action)
             self.servo_action[leg.knee_index] = clip_unit(knee_action)
 
@@ -1494,7 +1751,7 @@ class HanachanCPGController:
             yaw, lift, knee = evaluate_leg_motion(design, phase)
             self.servo_action[leg.yaw_index] = clip_unit(leg.side_sign * yaw)
             self.servo_action[leg.lift_index] = clip_unit(-leg.side_sign * lift)
-            self.servo_action[leg.knee_index] = clip_unit(knee)
+            self.servo_action[leg.knee_index] = clip_unit(leg.side_sign * knee)
 
     def targets_from_action(self) -> dict[int, int]:
         targets: dict[int, int] = {}
@@ -1563,7 +1820,7 @@ class HanachanCPGController:
         self.leg_motion_hold_targets.clear()
         self.motion_enabled = True
         self.phase_rad = 0.0
-        self.filtered_params = [clip_unit(value) for value in self.config.gait_params]
+        self.filtered_params = [clip_unit(value) for value in self.gait_params]
 
     def start_leg_motion(
         self,
@@ -1670,15 +1927,24 @@ class CPGGui:
         torque_off_exit: bool,
         control_hz: float | None,
         onboard_cpg: bool,
+        gait_model: str = DEFAULT_GAIT_MODEL,
     ) -> None:
         import tkinter as tk
         from tkinter import messagebox, ttk
 
+        if onboard_cpg and gait_model != "v1":
+            raise RuntimeError(
+                "onboard CPG firmware only implements the v1 gait model; "
+                "drop --onboard-cpg to run v2 from the PC"
+            )
+
         self.tk = tk
         self.ttk = ttk
         self.messagebox = messagebox
+        self.gait_model = gait_model
+        self.model = GAIT_MODELS[gait_model]
         self.root = tk.Tk()
-        self.root.title("Hanachan CPG Tuner")
+        self.root.title(f"Hanachan CPG Tuner ({gait_model})")
         self.root.geometry("980x760")
         self.root.minsize(780, 620)
 
@@ -1689,7 +1955,7 @@ class CPGGui:
             self.controller = OnboardHanachanCPGController(self.bus, config)
         else:
             self.bus = DynamixelBus(device, baudrate, protocol)
-            self.controller = HanachanCPGController(self.bus, config)
+            self.controller = HanachanCPGController(self.bus, config, gait_model)
         self.output_path = output_path
         self.preset_path = preset_path
         self.leg_design_path = leg_design_path
@@ -1704,8 +1970,9 @@ class CPGGui:
         self.torque_on = torque_on
         self.torque_off_exit = torque_off_exit
         self.control_period = resolve_control_period(baudrate, control_hz)
-        self.param_vars = [tk.DoubleVar(value=value) for value in self.config.gait_params]
-        self.param_value_vars = [tk.StringVar() for _ in range(PARAM_COUNT)]
+        self.gait_params = config.params_for(gait_model)
+        self.param_vars = [tk.DoubleVar(value=value) for value in self.gait_params]
+        self.param_value_vars = [tk.StringVar() for _ in range(self.model.param_count)]
         self.traction_phase_var = tk.DoubleVar(
             value=math.degrees(self.config.sweep_phase_offset_rad)
         )
@@ -1714,8 +1981,11 @@ class CPGGui:
         self.preset_name_var = tk.StringVar()
         self.preset_combo = None
         self.leg_motion_designer = None
-        self.show_advanced_var = tk.BooleanVar(value=False)
+        # The parameter sliders live only in the advanced panel, so show it by default.
+        self.show_advanced_var = tk.BooleanVar(value=True)
         self.advanced_container = None
+        self.show_body_var = tk.BooleanVar(value=False)
+        self.body_container = None
         self.footer = None
         self.body_vars: dict[int, tk.IntVar] = {}
         self.body_value_vars: dict[int, tk.StringVar] = {}
@@ -1785,8 +2055,8 @@ class CPGGui:
         presets.pack(fill=tk.X, pady=(0, 8))
         quick_presets = ttk.Frame(presets)
         quick_presets.pack(fill=tk.X)
-        ttk.Button(quick_presets, text="Safe slow", command=lambda: self.apply_gait_preset(SAFE_GAIT_PARAMS, "Safe slow")).pack(side=tk.LEFT)
-        ttk.Button(quick_presets, text="Forward (design)", command=lambda: self.apply_gait_preset(FORWARD_GAIT_PARAMS, "Forward")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(quick_presets, text="Safe slow", command=lambda: self.apply_gait_preset(self.model.safe_params, "Safe slow")).pack(side=tk.LEFT)
+        ttk.Button(quick_presets, text="Forward (design)", command=lambda: self.apply_gait_preset(self.model.forward_params, "Forward")).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(
             quick_presets,
             text="Initial position (2 s)",
@@ -1810,7 +2080,7 @@ class CPGGui:
         self.preset_combo = ttk.Combobox(
             named_presets,
             textvariable=self.preset_name_var,
-            values=[preset.name for preset in self.gait_presets],
+            values=[preset.name for preset in self.presets_for_model()],
             width=30,
         )
         self.preset_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
@@ -1822,34 +2092,13 @@ class CPGGui:
             side=tk.LEFT, padx=(6, 0)
         )
 
-        easy = ttk.LabelFrame(outer, text="Easy tuning", padding=10)
+        # Every gait parameter has a slider in the advanced panel, so this frame
+        # only carries what is not a gait parameter.
+        easy = ttk.LabelFrame(outer, text="Timing and tests", padding=10)
         easy.pack(fill=tk.X, pady=(0, 8))
         easy.columnconfigure(1, weight=1)
-        for row, (label, index) in enumerate(
-            (("Speed", 0), ("Stride", 1), ("Foot clearance", 2), ("Knee fold", 3))
-        ):
-            ttk.Label(easy, text=label, width=18).grid(row=row, column=0, sticky="w")
-            tk.Scale(
-                easy,
-                from_=-1.0,
-                to=1.0,
-                orient=tk.HORIZONTAL,
-                showvalue=False,
-                resolution=0.01,
-                variable=self.param_vars[index],
-                command=lambda _value, i=index: self.param_changed(i),
-            ).grid(row=row, column=1, sticky="ew")
-            ttk.Label(
-                easy,
-                textvariable=self.param_value_vars[index],
-                width=18,
-            ).grid(row=row, column=2, sticky="e", padx=(8, 0))
-            self.update_param_label(index)
 
-        traction_row = 4
-        ttk.Label(easy, text="Traction timing", width=18).grid(
-            row=traction_row, column=0, sticky="w"
-        )
+        ttk.Label(easy, text="Traction timing", width=18).grid(row=0, column=0, sticky="w")
         tk.Scale(
             easy,
             from_=-180,
@@ -1859,16 +2108,16 @@ class CPGGui:
             resolution=5,
             variable=self.traction_phase_var,
             command=self.traction_phase_changed,
-        ).grid(row=traction_row, column=1, sticky="ew")
+        ).grid(row=0, column=1, sticky="ew")
         ttk.Label(
             easy,
             textvariable=self.traction_phase_value_var,
             width=18,
-        ).grid(row=traction_row, column=2, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=2, sticky="e", padx=(8, 0))
         self.update_traction_phase_label()
 
         timing_buttons = ttk.Frame(easy)
-        timing_buttons.grid(row=5, column=1, sticky="w", pady=(4, 8))
+        timing_buttons.grid(row=1, column=1, sticky="w", pady=(4, 8))
         for degrees in (-90, -45, 0, 45, 90):
             ttk.Button(
                 timing_buttons,
@@ -1877,7 +2126,7 @@ class CPGGui:
             ).pack(side=tk.LEFT, padx=(0, 4))
 
         test_modes = ttk.Frame(easy)
-        test_modes.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        test_modes.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         ttk.Label(test_modes, text="Step test:").pack(side=tk.LEFT)
         ttk.Button(
             test_modes,
@@ -1906,9 +2155,17 @@ class CPGGui:
 
         body = ttk.LabelFrame(self.advanced_container, text="Body positions", padding=8)
         body.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(
+            body,
+            text="Show body position sliders",
+            variable=self.show_body_var,
+            command=self.toggle_body_positions,
+        ).pack(anchor=tk.W)
+        # Collapsed by default so the gait parameter list below gets the space.
+        self.body_container = ttk.Frame(body)
         for column, index in enumerate(BODY_JOINT_INDEX):
-            body.columnconfigure(column, weight=1)
-            cell = ttk.Frame(body)
+            self.body_container.columnconfigure(column, weight=1)
+            cell = ttk.Frame(self.body_container)
             cell.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0))
             dxl_id = self.config.ids[index]
             zero_tick = self.config.zero_ticks[index]
@@ -1936,9 +2193,10 @@ class CPGGui:
             )
             scale.pack(fill=tk.X)
             ttk.Label(cell, textvariable=value_var).pack(anchor=tk.E)
-        ttk.Button(body, text="Use CPG body", command=self.use_cpg_body).grid(
+        ttk.Button(self.body_container, text="Use CPG body", command=self.use_cpg_body).grid(
             row=1, column=0, columnspan=3, sticky="e", pady=(6, 0)
         )
+        self.toggle_body_positions()
 
         param_container = ttk.LabelFrame(
             self.advanced_container,
@@ -1956,7 +2214,7 @@ class CPGGui:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         params.columnconfigure(1, weight=1)
-        for index, (name, _unit, _low, _high) in enumerate(GAIT_PARAM_SPECS):
+        for index, (name, _unit, _low, _high) in enumerate(self.model.specs):
             ttk.Label(params, text=name, width=18).grid(row=index, column=0, sticky="w", padx=(0, 8))
             scale = tk.Scale(
                 params,
@@ -1974,7 +2232,7 @@ class CPGGui:
             )
             ttk.Label(
                 params,
-                text=GAIT_PARAM_DESCRIPTIONS[index],
+                text=self.model.descriptions[index],
                 wraplength=330,
                 justify=tk.LEFT,
             ).grid(row=index, column=3, sticky="w", padx=(14, 0))
@@ -1994,6 +2252,9 @@ class CPGGui:
                 f"Ready. {rate_text}. Config: {self.output_path}. Presets: {self.preset_path}"
             )
 
+        # Needs the footer, which is why it runs here and not where the panel is built.
+        self.toggle_advanced_controls()
+
     def toggle_advanced_controls(self) -> None:
         if self.advanced_container is None or self.footer is None:
             return
@@ -2006,6 +2267,14 @@ class CPGGui:
             )
         else:
             self.advanced_container.pack_forget()
+
+    def toggle_body_positions(self) -> None:
+        if self.body_container is None:
+            return
+        if self.show_body_var.get():
+            self.body_container.pack(fill=self.tk.X, pady=(6, 0))
+        else:
+            self.body_container.pack_forget()
 
     def open_leg_motion_designer(self) -> None:
         if self.onboard_cpg:
@@ -2030,13 +2299,13 @@ class CPGGui:
 
     def update_param_label(self, index: int) -> None:
         normalized = self.param_vars[index].get()
-        _name, unit, low, high = GAIT_PARAM_SPECS[index]
+        _name, unit, low, high = self.model.specs[index]
         physical = map_range(normalized, low, high)
         suffix = f" {unit}" if unit else ""
         self.param_value_vars[index].set(f"{normalized:+.2f}  ({physical:.3f}{suffix})")
 
     def param_changed(self, index: int) -> None:
-        self.config.gait_params[index] = clip_unit(self.param_vars[index].get())
+        self.gait_params[index] = clip_unit(self.param_vars[index].get())
         self.update_param_label(index)
 
     def update_traction_phase_label(self) -> None:
@@ -2072,22 +2341,33 @@ class CPGGui:
 
     def apply_gait_preset(self, values: list[float], name: str) -> None:
         for index, value in enumerate(values):
-            self.config.gait_params[index] = value
+            self.gait_params[index] = value
             self.param_vars[index].set(value)
             self.update_param_label(index)
         self.status_var.set(f"{name} parameters loaded. Press Start to run.")
 
+    def presets_for_model(self) -> list[GaitPreset]:
+        """Presets from another gait model would be read with the wrong meaning."""
+        return [preset for preset in self.gait_presets if preset.gait_model == self.gait_model]
+
     def refresh_named_preset_list(self) -> None:
         if self.preset_combo is not None:
-            self.preset_combo.configure(values=[preset.name for preset in self.gait_presets])
+            self.preset_combo.configure(
+                values=[preset.name for preset in self.presets_for_model()]
+            )
 
     def selected_named_preset(self) -> GaitPreset:
         name = self.preset_name_var.get().strip()
         if not name:
             raise ValueError("Enter or select a preset name.")
-        for preset in self.gait_presets:
+        for preset in self.presets_for_model():
             if preset.name == name:
                 return preset
+        for preset in self.gait_presets:
+            if preset.name == name:
+                raise ValueError(
+                    f"Preset '{name}' belongs to gait model {preset.gait_model}, not {self.gait_model}"
+                )
         raise ValueError(f"Preset not found: {name}")
 
     def load_named_preset(self) -> None:
@@ -2119,9 +2399,10 @@ class CPGGui:
                 raise ValueError("Enter a preset name before saving.")
             preset = GaitPreset(
                 name=name,
-                gait_params=list(self.config.gait_params),
+                gait_params=list(self.gait_params),
                 sweep_phase_offset_rad=self.config.sweep_phase_offset_rad,
                 reverse_legs=self.config.reverse_legs,
+                gait_model=self.gait_model,
             )
             validate_gait_preset(preset)
             existing_index = next(
@@ -2322,6 +2603,7 @@ class CPGGui:
             "joint_lower": self.config.joint_lower,
             "joint_upper": self.config.joint_upper,
             "gait_params": self.config.gait_params,
+            "gait_params_v2": self.config.gait_params_v2,
             "enabled_indices": self.config.enabled_indices,
             "reverse_legs": self.config.reverse_legs,
             "sweep_phase_offset_rad": self.config.sweep_phase_offset_rad,
@@ -4223,16 +4505,19 @@ class RobotMappingGui:
                 directions[index] = self.selected_direction(index)
                 enabled_indices.append(index)
 
+            # Only ids, zero_ticks, directions, and enabled_indices are edited here.
+            # Everything else is carried over so tuned gait values survive a remap.
             data = {
                 "ids": ids,
                 "zero_ticks": zero_ticks,
                 "directions": directions,
-                "joint_lower": list(JOINT_LOWER),
-                "joint_upper": list(JOINT_UPPER),
-                "gait_params": list(DEFAULT_GAIT_PARAMS),
+                "joint_lower": list(self.config.joint_lower),
+                "joint_upper": list(self.config.joint_upper),
+                "gait_params": list(self.config.gait_params),
+                "gait_params_v2": list(self.config.gait_params_v2),
                 "enabled_indices": enabled_indices,
-                "reverse_legs": False,
-                "sweep_phase_offset_rad": 0.0,
+                "reverse_legs": self.config.reverse_legs,
+                "sweep_phase_offset_rad": self.config.sweep_phase_offset_rad,
             }
             with open(self.output_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -4265,6 +4550,7 @@ def add_robot_config_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--config",
+        default=DEFAULT_CONFIG_PATH,
         help="JSON file overriding ids, zero_ticks, directions, joint limits, or gait_params",
     )
     parser.add_argument(
@@ -4365,8 +4651,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     mapping = subparsers.add_parser("map", help="assign detected motor IDs to robot joints")
     mapping.add_argument("--ids", type=parse_ids, default=parse_ids("1-252"))
-    mapping.add_argument("--config", default="", help="existing config to load before editing")
-    mapping.add_argument("--output", default="robot_config.json", help="config JSON to write")
+    mapping.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help="existing config to load before editing",
+    )
+    mapping.add_argument("--output", default=DEFAULT_CONFIG_PATH, help="config JSON to write")
     mapping.add_argument(
         "--layout",
         choices=("three-segment", "full"),
@@ -4392,6 +4682,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     teach.add_argument(
         "--config",
+        default=DEFAULT_CONFIG_PATH,
         help="JSON file defining robot ids and enabled_indices",
     )
     teach.add_argument(
@@ -4442,11 +4733,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="control frequency; defaults to 8 Hz at wireless baudrates and 50 Hz otherwise",
     )
 
-    cpg_gui = subparsers.add_parser("cpg-gui", help="tune and run the Hanachan CPG with sliders")
+    for command, model_help in (
+        ("cpg-gui", "tune and run the Hanachan CPG with sliders (v1 gait model)"),
+        ("cpg-gui-v2", "tune and run the v2 gait model with sliders"),
+    ):
+        add_cpg_gui_args(subparsers.add_parser(command, help=model_help))
+
+    return parser
+
+
+def add_cpg_gui_args(cpg_gui: argparse.ArgumentParser) -> None:
     add_robot_config_args(cpg_gui)
     cpg_gui.add_argument(
         "--output",
-        default="robot_config.tuned.json",
+        default=DEFAULT_CONFIG_PATH,
         help="config JSON written by the Save Config button",
     )
     cpg_gui.add_argument(
@@ -4492,8 +4792,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the 50 Hz CPG on OpenRB and send only parameters over wireless serial",
     )
 
-    return parser
-
 
 def choose_device(device: str | None) -> str:
     if device:
@@ -4506,7 +4804,10 @@ def choose_device(device: str | None) -> str:
         raise RuntimeError(
             "serial device was not found. Reconnect OpenRB-150 or pass --device explicitly."
         )
-    candidates = "\n  ".join(ports)
+    descriptions = describe_ports()
+    candidates = "\n  ".join(
+        f"{port} ({descriptions[port]})" if descriptions.get(port) else port for port in ports
+    )
     raise RuntimeError(f"multiple serial devices found. Pass one with --device:\n  {candidates}")
 
 
@@ -4514,6 +4815,7 @@ def print_not_found_help() -> None:
     print("No DYNAMIXEL found.")
     print("Hints:")
     print("  - On macOS, try /dev/cu.* instead of /dev/tty.*.")
+    print("  - On Windows, pass the COM port, for example --device COM5.")
     print("  - Try: discover --ids 1-252")
     print("  - Check DYNAMIXEL power, ID, baudrate, and protocol.")
     print("  - OpenRB-150 must be running USB-to-DYNAMIXEL bridge firmware for PC SDK access.")
@@ -4531,7 +4833,10 @@ def enqueue_stdin_commands(commands: queue.Queue[str], stop_event: threading.Eve
                 commands.put(char)
 
 
-def build_robot_config_from_args(args: argparse.Namespace) -> RobotConfig:
+def build_robot_config_from_args(
+    args: argparse.Namespace,
+    gait_model: str = DEFAULT_GAIT_MODEL,
+) -> RobotConfig:
     config = load_robot_config(args.config, args.layout)
     return apply_robot_overrides(
         config,
@@ -4541,6 +4846,7 @@ def build_robot_config_from_args(args: argparse.Namespace) -> RobotConfig:
         gait_params=args.gait_params,
         zero_overrides=args.zero_overrides,
         direction_overrides=args.direction_overrides,
+        gait_model=gait_model,
     )
 
 
@@ -4646,13 +4952,16 @@ def run(args: argparse.Namespace) -> None:
         run_cpg(args, device)
         return
 
-    if args.command == "cpg-gui":
-        config = build_robot_config_from_args(args)
+    if args.command in ("cpg-gui", "cpg-gui-v2"):
+        gait_model = "v2" if args.command == "cpg-gui-v2" else "v1"
+        model = GAIT_MODELS[gait_model]
+        config = build_robot_config_from_args(args, gait_model)
         if args.gait_params is None:
+            active = config.params_for(gait_model)
             if args.initial_preset == "safe":
-                config.gait_params = list(SAFE_GAIT_PARAMS)
+                active[:] = model.safe_params
             elif args.initial_preset == "forward":
-                config.gait_params = list(FORWARD_GAIT_PARAMS)
+                active[:] = model.forward_params
         gui = CPGGui(
             device=device,
             baudrate=args.baudrate,
@@ -4667,6 +4976,7 @@ def run(args: argparse.Namespace) -> None:
             torque_off_exit=args.torque_off_exit,
             control_hz=args.control_hz,
             onboard_cpg=args.onboard_cpg,
+            gait_model=gait_model,
         )
         gui.run()
         return
