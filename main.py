@@ -39,7 +39,6 @@ DEFAULT_CONFIG_PATH = "robot_config.json"
 WIRELESS_RETRY_ATTEMPTS = 5
 WIRELESS_RETRY_DELAY_SECONDS = 0.01
 WIRELESS_MINIMUM_PACKET_TIMEOUT_MS = 120.0
-WIRELESS_UNICAST_GAP_SECONDS = 0.005
 POSITION_CONTROL_MODE = 3
 TABLE = ControlTable()
 
@@ -55,7 +54,9 @@ CONTROL_PERIOD_SECONDS = 0.02
 INITIAL_POSITION_DURATION_SECONDS = 2.0
 BODY_SLIDER_SEND_INTERVAL_MS = 20
 GAIT_TEST_MODES = ("full", "lift", "ground")
-DEFAULT_WIRELESS_CONTROL_HZ = 8.0
+# A 57600 bps link carries 5760 bytes/s; one sync write is ~119 bytes, so 40 Hz
+# already spends 83% of the link and starves reads. 30 Hz leaves room.
+DEFAULT_WIRELESS_CONTROL_HZ = 30.0
 DEFAULT_WIRED_CONTROL_HZ = 50.0
 TICKS_PER_RAD = 4096.0 / TWO_PI_F
 
@@ -202,7 +203,7 @@ GAIT_PARAM_SPECS_V2 = [
     ("Leg swing", "", -0.55, 0.55),
     ("Foot level", "", -1.50, 1.50),
     ("Foot clearance", "", -0.50, 0.50),
-    ("Stance duty", "", 0.35, 0.75),
+    ("Stance duty", "", 0.35, 0.90),
     ("Knee bias", "", -0.35, 0.35),
     ("Lift bias", "", -0.35, 0.35),
     ("Turn", "", -1.00, 1.00),
@@ -212,6 +213,7 @@ GAIT_PARAM_SPECS_V2 = [
     ("Body phase", "rad", -PI_F, PI_F),
     ("Body turn", "", -0.35, 0.35),
     ("Knee phase", "rad", -PI_F, PI_F),
+    ("Body rate", "x", 0.25, 4.00),
 ]
 GAIT_PARAM_DESCRIPTIONS_V2 = [
     "歩行周期の速さ。全関節のCPG位相が進む速度を変える。",
@@ -220,7 +222,7 @@ GAIT_PARAM_DESCRIPTIONS_V2 = [
     "liftの前後振幅。yawと同位相で脚全体を前後に振る量。負でlift/kneeがまとめて反転する。",
     "膝とliftの連動係数。1.0でliftの回転を膝が打ち消し、足裏が地面と平行に保たれる。",
     "遊脚中だけliftに加算される持ち上げ量。接地を避けるクリアランス。持ち上げ向きが逆なら負にする。",
-    "1周期に占める接地期の割合。大きいほど蹴っている時間が長い。",
+    "1周期に占める接地期の割合。接地と遊脚の速度比を決める。0.9で遊脚が9倍速い。",
     "膝の固定オフセット。立脚時を含む基本の膝曲げ量を変える。",
     "liftの固定オフセット。基本姿勢の高さ・接地圧をずらす。",
     "左右のStride差。正で左脚の歩幅が伸び、右へ旋回する。",
@@ -230,6 +232,7 @@ GAIT_PARAM_DESCRIPTIONS_V2 = [
     "胴体関節間の位相差。胴体を伝わる波の向きと形を変える。",
     "胴体関節ID 1〜3を同じ向きに曲げる固定量。旋回に使う。",
     "膝がliftから遅れる位相。足裏が地面と平行にならないときの追従タイミング補正。",
+    "胴体波の周波数倍率。1.0で脚と同じ周期、2.0で脚1周期あたり胴体2周期。",
 ]
 SAFE_GAIT_PARAMS_V2 = [
     -0.789474,
@@ -238,7 +241,7 @@ SAFE_GAIT_PARAMS_V2 = [
     0.181818,
     0.666667,
     0.200000,
-    0.000000,
+    -0.272727,
     0.000000,
     0.000000,
     0.000000,
@@ -248,6 +251,7 @@ SAFE_GAIT_PARAMS_V2 = [
     0.652535,
     0.000000,
     0.000000,
+    -0.600000,
 ]
 FORWARD_GAIT_PARAMS_V2 = [
     -0.052632,
@@ -256,7 +260,7 @@ FORWARD_GAIT_PARAMS_V2 = [
     0.509091,
     0.666667,
     0.440000,
-    0.250000,
+    -0.090909,
     0.000000,
     0.000000,
     0.000000,
@@ -266,6 +270,7 @@ FORWARD_GAIT_PARAMS_V2 = [
     0.652535,
     0.000000,
     0.000000,
+    -0.600000,
 ]
 @dataclass(frozen=True)
 class GaitModel:
@@ -552,9 +557,13 @@ def load_robot_config(path: str | None, layout: str = "three-segment") -> RobotC
     if "joint_upper" in data:
         config.joint_upper = [float(value) for value in data["joint_upper"]]
     if "gait_params" in data:
-        config.gait_params = [float(value) for value in data["gait_params"]]
+        config.gait_params = fit_gait_params(
+            [float(value) for value in data["gait_params"]], "v1"
+        )
     if "gait_params_v2" in data:
-        config.gait_params_v2 = [float(value) for value in data["gait_params_v2"]]
+        config.gait_params_v2 = fit_gait_params(
+            [float(value) for value in data["gait_params_v2"]], "v2"
+        )
     if "enabled_indices" in data:
         config.enabled_indices = [int(value) for value in data["enabled_indices"]]
     if "reverse_legs" in data:
@@ -752,7 +761,7 @@ def load_gait_presets(path: str) -> list[GaitPreset]:
         raise ValueError("gait preset file presets must be an array")
 
     presets: list[GaitPreset] = []
-    seen_names: set[str] = set()
+    seen_names: set[tuple[str, str]] = set()
     for raw in raw_presets:
         if not isinstance(raw, dict):
             raise ValueError("each gait preset must be an object")
@@ -760,28 +769,39 @@ def load_gait_presets(path: str) -> list[GaitPreset]:
         params = raw.get("gait_params")
         if not isinstance(name, str) or not isinstance(params, list):
             raise ValueError("each gait preset requires name and gait_params")
+        gait_model = str(raw.get("gait_model", "v1"))
+        if gait_model not in GAIT_MODELS:
+            raise ValueError(f"unknown gait preset model: {gait_model}")
         preset = GaitPreset(
             name=name.strip(),
-            gait_params=[float(value) for value in params],
+            gait_params=fit_gait_params([float(value) for value in params], gait_model),
             sweep_phase_offset_rad=float(raw.get("sweep_phase_offset_rad", 0.0)),
             reverse_legs=raw.get("reverse_legs", False),
-            gait_model=str(raw.get("gait_model", "v1")),
+            gait_model=gait_model,
         )
         validate_gait_preset(preset)
-        if preset.name in seen_names:
-            raise ValueError(f"duplicate gait preset name: {preset.name}")
-        seen_names.add(preset.name)
+        key = (preset.name, preset.gait_model)
+        if key in seen_names:
+            raise ValueError(
+                f"duplicate gait preset name for {preset.gait_model}: {preset.name}"
+            )
+        seen_names.add(key)
         presets.append(preset)
     return presets
 
 
 def save_gait_presets(path: str, presets: list[GaitPreset]) -> None:
-    seen_names: set[str] = set()
+    # A name only has to be unique within its gait model, since the parameters
+    # mean different things across models.
+    seen_names: set[tuple[str, str]] = set()
     for preset in presets:
         validate_gait_preset(preset)
-        if preset.name in seen_names:
-            raise ValueError(f"duplicate gait preset name: {preset.name}")
-        seen_names.add(preset.name)
+        key = (preset.name, preset.gait_model)
+        if key in seen_names:
+            raise ValueError(
+                f"duplicate gait preset name for {preset.gait_model}: {preset.name}"
+            )
+        seen_names.add(key)
     data = {
         "format": GAIT_PRESET_FORMAT,
         "version": GAIT_PRESET_VERSION,
@@ -1119,6 +1139,21 @@ def apply_robot_overrides(
     return config
 
 
+def fit_gait_params(values: list[float], gait_model: str) -> list[float]:
+    """Pad a saved parameter list that predates parameters added to the model.
+
+    New parameters are only ever appended, and their defaults are neutral, so an
+    older file keeps the gait it was tuned for. A longer list is a real mismatch.
+    """
+    model = GAIT_MODELS[gait_model]
+    if len(values) > model.param_count:
+        raise ValueError(
+            f"{gait_model} gait params must contain at most {model.param_count} "
+            f"values, got {len(values)}"
+        )
+    return list(values) + list(model.safe_params[len(values):])
+
+
 def gait_stroke(cycle: float, stance_duty: float) -> tuple[float, float]:
     """Fore-aft stroke and foot rise at one point of the v2 cycle.
 
@@ -1314,21 +1349,10 @@ class DynamixelBus:
         )
 
     def sync_move_to(self, targets: dict[int, int]) -> None:
-        if self.wireless_link:
-            for dxl_id, position in targets.items():
-                comm_result = self.packet.write4ByteTxOnly(
-                    self.port,
-                    dxl_id,
-                    TABLE.goal_position,
-                    int(position),
-                )
-                if comm_result != COMM_SUCCESS:
-                    raise RuntimeError(
-                        f"wireless move id={dxl_id}: {self.packet.getTxRxResult(comm_result)}"
-                    )
-                time.sleep(WIRELESS_UNICAST_GAP_SECONDS)
-            return
-
+        # One sync write beats per-servo unicast on a slow link: 21 joints fit in
+        # a single ~119 byte packet instead of 21 packets totalling ~336 bytes.
+        # Measured over a 57600 bps radio, that is 20 ms per update instead of
+        # 122 ms, which is the difference between 8 Hz and 40 Hz control.
         group = GroupSyncWrite(self.port, self.packet, TABLE.goal_position, 4)
         for dxl_id, position in targets.items():
             raw = int(position)
@@ -1494,6 +1518,9 @@ class HanachanCPGController:
         self.filtered_params = [0.0] * GAIT_MODELS[gait_model].param_count
         self.servo_action = [0.0] * SERVO_COUNT
         self.phase_rad = 0.0
+        # Separate accumulator: scaling phase_rad would jump at every leg wrap
+        # unless the body rate happened to be a whole number.
+        self.body_phase_rad = 0.0
         self.motion_enabled = False
         self.body_tick_overrides: dict[int, int] = {}
         self.gait_test_mode = "full"
@@ -1629,6 +1656,7 @@ class HanachanCPGController:
         body_lag = self.param(13)
         body_turn = self.param(14)
         knee_phase = self.param(15)
+        body_rate = self.param(16)
         sweep_direction = -1.0 if self.config.reverse_legs else 1.0
 
         self.phase_rad += TWO_PI_F * frequency_hz * dt
@@ -1674,8 +1702,11 @@ class HanachanCPGController:
             )
 
         # Body turn bends IDs 1-3 the same way to steer; the wave rides on top of it.
+        self.body_phase_rad += TWO_PI_F * frequency_hz * body_rate * dt
+        while self.body_phase_rad >= TWO_PI_F:
+            self.body_phase_rad -= TWO_PI_F
         for i in range(BODY_COUNT):
-            body_phase = self.phase_rad + i * body_lag
+            body_phase = self.body_phase_rad + i * body_lag
             body_wave = body_amp * math.sin(body_phase) if self.gait_test_mode == "full" else 0.0
             self.servo_action[BODY_JOINT_INDEX[i]] = clip_unit(body_turn + body_wave)
 
@@ -1820,6 +1851,7 @@ class HanachanCPGController:
         self.leg_motion_hold_targets.clear()
         self.motion_enabled = True
         self.phase_rad = 0.0
+        self.body_phase_rad = 0.0
         self.filtered_params = [clip_unit(value) for value in self.gait_params]
 
     def start_leg_motion(
@@ -2405,8 +2437,14 @@ class CPGGui:
                 gait_model=self.gait_model,
             )
             validate_gait_preset(preset)
+            # Keyed by model too: the list only shows this model, so matching on
+            # the name alone would silently replace another model's preset.
             existing_index = next(
-                (index for index, item in enumerate(self.gait_presets) if item.name == name),
+                (
+                    index
+                    for index, item in enumerate(self.gait_presets)
+                    if item.name == name and item.gait_model == self.gait_model
+                ),
                 None,
             )
             if existing_index is not None:
@@ -2434,7 +2472,11 @@ class CPGGui:
                 f"Delete preset '{preset.name}'?",
             ):
                 return
-            self.gait_presets = [item for item in self.gait_presets if item.name != preset.name]
+            self.gait_presets = [
+                item
+                for item in self.gait_presets
+                if not (item.name == preset.name and item.gait_model == preset.gait_model)
+            ]
             save_gait_presets(self.preset_path, self.gait_presets)
             self.preset_name_var.set("")
             self.refresh_named_preset_list()
