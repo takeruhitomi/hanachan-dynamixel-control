@@ -19,12 +19,26 @@ from dynamixel_sdk import COMM_SUCCESS, GroupSyncWrite, PacketHandler, PortHandl
 @dataclass(frozen=True)
 class ControlTable:
     id: int = 7
+    drive_mode: int = 10
     operating_mode: int = 11
     torque_enable: int = 64
     led: int = 65
+    profile_acceleration: int = 108
+    profile_velocity: int = 112
     goal_position: int = 116
     present_position: int = 132
     moving: int = 122
+
+
+DRIVE_MODE_TIME_BASED_PROFILE = 0x04
+
+# With no profile set, a servo jumps to each goal at full speed and then waits
+# for the next one, which reads as stepping once the control period is long.
+# In time-based profile mode the servo spreads the move over a set time, so
+# giving it slightly longer than one control period means the next goal always
+# arrives while it is still moving.
+PROFILE_TRAVEL_FACTOR = 1.5
+PROFILE_ACCEL_FRACTION = 0.3
 
 
 DEFAULT_BAUDRATE = 1_000_000
@@ -54,9 +68,12 @@ CONTROL_PERIOD_SECONDS = 0.02
 INITIAL_POSITION_DURATION_SECONDS = 2.0
 BODY_SLIDER_SEND_INTERVAL_MS = 20
 GAIT_TEST_MODES = ("full", "lift", "ground")
-# A 57600 bps link carries 5760 bytes/s; one sync write is ~119 bytes, so 40 Hz
-# already spends 83% of the link and starves reads. 30 Hz leaves room.
-DEFAULT_WIRELESS_CONTROL_HZ = 30.0
+# The radio carries far less than its UART rate suggests: 57600 bps is 5760
+# bytes/s on paper but measured about 1700 bytes/s once the radio's own framing
+# and retries are paid for. One sync write is ~119 bytes, so anything past
+# roughly 14 Hz queues faster than the link drains and the backlog grows without
+# bound. Re-measure before raising this.
+DEFAULT_WIRELESS_CONTROL_HZ = 10.0
 DEFAULT_WIRED_CONTROL_HZ = 50.0
 TICKS_PER_RAD = 4096.0 / TWO_PI_F
 
@@ -1293,6 +1310,38 @@ class DynamixelBus:
             attempts=1,
         )
 
+    def set_time_based_profile(self, dxl_id: int, enabled: bool) -> None:
+        """Drive Mode lives in EEPROM, so the caller must disable torque first."""
+        current = self.execute_packet(
+            f"read drive mode id={dxl_id}",
+            lambda: self.packet.read1ByteTxRx(self.port, dxl_id, TABLE.drive_mode),
+        )[0]
+        if enabled:
+            value = current | DRIVE_MODE_TIME_BASED_PROFILE
+        else:
+            value = current & ~DRIVE_MODE_TIME_BASED_PROFILE
+        if value == current:
+            return
+        self.execute_packet(
+            f"set drive mode id={dxl_id}",
+            lambda: self.packet.write1ByteTxRx(self.port, dxl_id, TABLE.drive_mode, value),
+        )
+
+    def set_profile_timing(self, dxl_id: int, travel_ms: int, accel_ms: int) -> None:
+        """Only meaningful in time-based profile mode, where both are milliseconds."""
+        self.execute_packet(
+            f"set profile acceleration id={dxl_id}",
+            lambda: self.packet.write4ByteTxRx(
+                self.port, dxl_id, TABLE.profile_acceleration, int(accel_ms)
+            ),
+        )
+        self.execute_packet(
+            f"set profile velocity id={dxl_id}",
+            lambda: self.packet.write4ByteTxRx(
+                self.port, dxl_id, TABLE.profile_velocity, int(travel_ms)
+            ),
+        )
+
     def set_position_mode(self, dxl_id: int) -> None:
         self.execute_packet(
             f"set position mode id={dxl_id}",
@@ -1845,6 +1894,21 @@ class HanachanCPGController:
             dxl_id = self.config.ids[index]
             self.bus.set_torque(dxl_id, True)
 
+    def configure_profile(self, control_period: float) -> None:
+        """Let each servo interpolate between goals instead of jumping to them.
+
+        Torque is cycled one servo at a time because Drive Mode is in EEPROM;
+        taking the whole robot limp at once would drop it.
+        """
+        travel_ms = max(1, round(control_period * 1000.0 * PROFILE_TRAVEL_FACTOR))
+        accel_ms = max(0, round(travel_ms * PROFILE_ACCEL_FRACTION))
+        for index in self.config.enabled_indices:
+            dxl_id = self.config.ids[index]
+            self.bus.set_torque(dxl_id, False)
+            self.bus.set_time_based_profile(dxl_id, True)
+            self.bus.set_torque(dxl_id, True)
+            self.bus.set_profile_timing(dxl_id, travel_ms, accel_ms)
+
     def start_motion(self) -> None:
         self.motion_source = "cpg"
         self.leg_motion_controlled_indices.clear()
@@ -2049,6 +2113,8 @@ class CPGGui:
 
             if not self.skip_init:
                 self.controller.initialize_servos(set_position_mode=not self.skip_position_mode)
+                if not self.onboard_cpg:
+                    self.controller.configure_profile(self.control_period)
             elif self.torque_on:
                 self.controller.set_torque(True)
 
@@ -4907,6 +4973,7 @@ def run_cpg(args: argparse.Namespace, device: str) -> None:
         controller = HanachanCPGController(bus, config)
         if not args.skip_init:
             controller.initialize_servos(set_position_mode=not args.skip_position_mode)
+            controller.configure_profile(control_period)
         elif args.torque_on:
             controller.set_torque(True)
 
