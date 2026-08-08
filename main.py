@@ -9,7 +9,7 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -226,7 +226,10 @@ GAIT_PARAM_SPECS_V2 = [
     ("Turn", "", -1.00, 1.00),
     ("Segment phase", "rad", -PI_F, PI_F),
     ("Left/right phase", "rad", 0.45 * PI_F, 1.35 * PI_F),
-    ("Body wave", "", 0.00, 0.38),
+    # The body joints allow +-0.436 rad, so the old 0.38 ceiling only reached
+    # 9.5 degrees and every saved gait sat pinned against it. rad_to_raw_tick
+    # clamps to the joint limits, so a wider range cannot drive past the stops.
+    ("Body wave", "", 0.00, 0.90),
     ("Body phase", "rad", -PI_F, PI_F),
     ("Body turn", "", -0.35, 0.35),
     ("Knee phase", "rad", -PI_F, PI_F),
@@ -242,7 +245,7 @@ GAIT_PARAM_DESCRIPTIONS_V2 = [
     "1周期に占める接地期の割合。接地と遊脚の速度比を決める。0.9で遊脚が9倍速い。",
     "膝の固定オフセット。立脚時を含む基本の膝曲げ量を変える。",
     "liftの固定オフセット。基本姿勢の高さ・接地圧をずらす。",
-    "左右のStride差。正で左脚の歩幅が伸び、右へ旋回する。",
+    "左右の駆動差。0.5で片側が止まり軸旋回、1.0で片側が逆に振れてその場回転になる。",
     "前後セグメント間の脚位相差。π付近では隣接脚群が交互になる。",
     "左脚群と右脚群の位相差。π付近では左右が交互になる。",
     "胴体関節ID 1〜3の周期的な曲げ振幅。",
@@ -264,7 +267,7 @@ SAFE_GAIT_PARAMS_V2 = [
     0.000000,
     1.000000,
     0.222222,
-    -0.736842,
+    -0.888889,
     0.652535,
     0.000000,
     0.000000,
@@ -283,7 +286,7 @@ FORWARD_GAIT_PARAMS_V2 = [
     0.000000,
     1.000000,
     0.222222,
-    -0.210526,
+    -0.666667,
     0.652535,
     0.000000,
     0.000000,
@@ -368,8 +371,6 @@ MOTION_SEQUENCE_FORMAT = "hanachan-motion-sequence"
 MOTION_SEQUENCE_VERSION = 1
 GAIT_PRESET_FORMAT = "hanachan-gait-presets"
 GAIT_PRESET_VERSION = 1
-LEG_MOTION_FORMAT = "hanachan-leg-motion-designs"
-LEG_MOTION_VERSION = 1
 
 
 @dataclass
@@ -383,6 +384,12 @@ class MotionFrame:
 class MotionSequence:
     servo_ids: list[int]
     frames: list[MotionFrame]
+    name: str = "motion"
+
+
+MOTION_LIBRARY_FORMAT = "hanachan-motion-library"
+MOTION_LIBRARY_VERSION = 1
+DEFAULT_MOTION_LIBRARY = "motions.json"
 
 
 @dataclass
@@ -393,23 +400,6 @@ class GaitPreset:
     reverse_legs: bool = False
     # Untagged presets predate the v2 model, so they can only be v1 values.
     gait_model: str = "v1"
-
-
-@dataclass
-class LegMotionKeyframe:
-    phase: float
-    yaw: float
-    lift: float
-    knee: float
-    duration_seconds: float = 0.25
-
-
-@dataclass
-class LegMotionDesign:
-    name: str
-    frequency_hz: float
-    keyframes: list[LegMotionKeyframe]
-    phase_offsets: list[float]
 
 
 def describe_ports() -> dict[str, str]:
@@ -678,7 +668,10 @@ def save_motion_sequence(path: str, sequence: MotionSequence) -> None:
 def load_motion_sequence(path: str) -> MotionSequence:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    return motion_sequence_from_data(data)
 
+
+def motion_sequence_from_data(data: dict) -> MotionSequence:
     if not isinstance(data, dict):
         raise ValueError("motion sequence root must be an object")
     if data.get("format") != MOTION_SEQUENCE_FORMAT:
@@ -726,6 +719,98 @@ def load_motion_sequence(path: str) -> MotionSequence:
     return sequence
 
 
+def sequence_to_library_entry(sequence: MotionSequence) -> dict:
+    entry = motion_sequence_to_data(sequence)
+    entry.pop("format", None)
+    entry.pop("version", None)
+    entry["name"] = sequence.name
+    return entry
+
+
+def load_motion_library(path: str) -> list[MotionSequence]:
+    """Named motions kept together in one file, like the gait presets are.
+
+    A file written before motions had names still loads: it holds one motion,
+    and the file name is the only name it ever had.
+    """
+    library_path = Path(path)
+    if not library_path.exists():
+        return []
+    with library_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("motion library root must be an object")
+
+    if data.get("format") == MOTION_SEQUENCE_FORMAT:
+        sequence = load_motion_sequence(path)
+        sequence.name = library_path.stem
+        return [sequence]
+
+    if data.get("format") != MOTION_LIBRARY_FORMAT:
+        raise ValueError(f"unsupported motion library format: {data.get('format')!r}")
+    if data.get("version") != MOTION_LIBRARY_VERSION:
+        raise ValueError(f"unsupported motion library version: {data.get('version')!r}")
+    raw_motions = data.get("motions")
+    if not isinstance(raw_motions, list):
+        raise ValueError("motion library motions must be an array")
+
+    motions: list[MotionSequence] = []
+    seen: set[str] = set()
+    for raw in raw_motions:
+        if not isinstance(raw, dict):
+            raise ValueError("each motion must be an object")
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("each motion requires a name")
+        payload = dict(raw)
+        payload["format"] = MOTION_SEQUENCE_FORMAT
+        payload["version"] = MOTION_SEQUENCE_VERSION
+        sequence = motion_sequence_from_data(payload)
+        sequence.name = name.strip()
+        if sequence.name in seen:
+            raise ValueError(f"duplicate motion name: {sequence.name}")
+        seen.add(sequence.name)
+        motions.append(sequence)
+    return motions
+
+
+LEGACY_MOTION_SEQUENCE = "motion_sequence.json"
+
+
+def load_motion_library_or_legacy(path: str) -> list[MotionSequence]:
+    """The library, falling back to a single motion saved before names existed."""
+    motions = load_motion_library(path)
+    if motions:
+        return motions
+    legacy = Path(path).with_name(LEGACY_MOTION_SEQUENCE)
+    if legacy.exists() and str(legacy) != str(Path(path)):
+        return load_motion_library(str(legacy))
+    return []
+
+
+def save_motion_library(path: str, motions: list[MotionSequence]) -> None:
+    seen: set[str] = set()
+    for sequence in motions:
+        if not sequence.name.strip():
+            raise ValueError("every motion needs a name")
+        if sequence.name in seen:
+            raise ValueError(f"duplicate motion name: {sequence.name}")
+        seen.add(sequence.name)
+        validate_motion_sequence(sequence)
+    data = {
+        "format": MOTION_LIBRARY_FORMAT,
+        "version": MOTION_LIBRARY_VERSION,
+        "motions": [sequence_to_library_entry(sequence) for sequence in motions],
+    }
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f"{output_path.name}.tmp")
+    with temporary_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    temporary_path.replace(output_path)
+
+
 def interpolate_positions(
     start: dict[int, int],
     target: dict[int, int],
@@ -738,6 +823,57 @@ def interpolate_positions(
         dxl_id: rounded(start[dxl_id] + (target[dxl_id] - start[dxl_id]) * clipped_progress)
         for dxl_id in start
     }
+
+
+class MotionSequencePlayer:
+    """Plays a recorded sequence frame by frame, optionally looping.
+
+    A frame's duration is the time taken to reach it, so playback always
+    interpolates from wherever the robot was to the frame's stored positions.
+    """
+
+    def __init__(self, sequence: MotionSequence, loop: bool = True) -> None:
+        self.sequence = sequence
+        self.loop = loop
+        self.index = 0
+        self.elapsed = 0.0
+        self.start_positions: dict[int, int] = {}
+        self.finished = False
+
+    def begin(self, current_positions: dict[int, int]) -> None:
+        self.index = 0
+        self.elapsed = 0.0
+        self.start_positions = dict(current_positions)
+        self.finished = False
+
+    @property
+    def frame_name(self) -> str:
+        if not self.sequence.frames:
+            return "-"
+        return self.sequence.frames[self.index].name
+
+    def step(self, dt: float) -> dict[int, int] | None:
+        if self.finished or not self.sequence.frames:
+            return None
+        frame = self.sequence.frames[self.index]
+        self.elapsed += dt
+        progress = (
+            1.0
+            if frame.duration_seconds <= 0.0
+            else self.elapsed / frame.duration_seconds
+        )
+        targets = interpolate_positions(self.start_positions, frame.positions, progress)
+        if progress >= 1.0:
+            self.start_positions = dict(frame.positions)
+            self.elapsed = 0.0
+            self.index += 1
+            if self.index >= len(self.sequence.frames):
+                if self.loop:
+                    self.index = 0
+                else:
+                    self.index = len(self.sequence.frames) - 1
+                    self.finished = True
+        return targets
 
 
 def validate_gait_preset(preset: GaitPreset) -> None:
@@ -831,286 +967,6 @@ def save_gait_presets(path: str, presets: list[GaitPreset]) -> None:
                 "gait_model": preset.gait_model,
             }
             for preset in presets
-        ],
-    }
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f"{output_path.name}.tmp")
-    with temporary_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    temporary_path.replace(output_path)
-
-
-def default_leg_motion_design(name: str = "New leg motion") -> LegMotionDesign:
-    return LegMotionDesign(
-        name=name,
-        frequency_hz=0.25,
-        keyframes=[
-            LegMotionKeyframe(0.00, 0.00, 0.00, 0.00, 2.0),
-            LegMotionKeyframe(0.50, 0.00, 0.00, 0.00, 2.0),
-        ],
-        phase_offsets=[0.00, 0.50, 0.50, 0.00, 0.00, 0.50, 0.50, 0.00],
-    )
-
-
-def update_leg_motion_timing(design: LegMotionDesign) -> None:
-    total_seconds = sum(keyframe.duration_seconds for keyframe in design.keyframes)
-    if total_seconds <= 0.0:
-        raise ValueError("leg motion cycle duration must be greater than zero")
-    elapsed = 0.0
-    for keyframe in design.keyframes:
-        keyframe.phase = elapsed / total_seconds
-        elapsed += keyframe.duration_seconds
-    design.frequency_hz = 1.0 / total_seconds
-
-
-def batch_edit_leg_motion_keyframes(
-    design: LegMotionDesign,
-    start_index: int,
-    end_index: int,
-    joint: str,
-    operation: str,
-    value_a: float,
-    value_b: float | None = None,
-) -> None:
-    if joint not in {"yaw", "lift", "knee", "duration_seconds"}:
-        raise ValueError(f"unknown leg joint column: {joint}")
-    if start_index < 0 or end_index >= len(design.keyframes) or start_index > end_index:
-        raise ValueError("invalid leg frame range")
-    if operation not in {"set", "add", "multiply", "ramp"}:
-        raise ValueError(f"unknown batch edit operation: {operation}")
-    if not math.isfinite(value_a) or (
-        value_b is not None and not math.isfinite(value_b)
-    ):
-        raise ValueError("batch edit values must be finite")
-    if operation == "ramp" and value_b is None:
-        raise ValueError("linear ramp requires both start and end values")
-
-    frame_count = end_index - start_index + 1
-    edited_values: list[float] = []
-    for offset, index in enumerate(range(start_index, end_index + 1)):
-        current = getattr(design.keyframes[index], joint)
-        if operation == "set":
-            edited = value_a
-        elif operation == "add":
-            edited = current + value_a
-        elif operation == "multiply":
-            edited = current * value_a
-        else:
-            progress = 0.0 if frame_count == 1 else offset / (frame_count - 1)
-            edited = value_a + (value_b - value_a) * progress
-        if joint == "duration_seconds":
-            edited_values.append(max(0.02, min(20.0, edited)))
-        else:
-            edited_values.append(clip_unit(edited))
-
-    for index, edited in zip(
-        range(start_index, end_index + 1),
-        edited_values,
-    ):
-        setattr(design.keyframes[index], joint, edited)
-    if joint == "duration_seconds":
-        update_leg_motion_timing(design)
-
-
-def delete_leg_motion_keyframe_range(
-    design: LegMotionDesign,
-    start_index: int,
-    end_index: int,
-) -> int:
-    if start_index < 0 or end_index >= len(design.keyframes) or start_index > end_index:
-        raise ValueError("invalid leg frame range")
-    delete_count = end_index - start_index + 1
-    if len(design.keyframes) - delete_count < 2:
-        raise ValueError("at least two leg frames must remain")
-    del design.keyframes[start_index : end_index + 1]
-    update_leg_motion_timing(design)
-    return delete_count
-
-
-def validate_leg_motion_design(design: LegMotionDesign) -> None:
-    if not design.name.strip():
-        raise ValueError("leg motion design name must not be empty")
-    if not math.isfinite(design.frequency_hz) or not 0.05 <= design.frequency_hz <= 2.0:
-        raise ValueError("leg motion frequency must be between 0.05 and 2.0 Hz")
-    require_length("leg motion phase offsets", design.phase_offsets, LEG_COUNT)
-    for offset in design.phase_offsets:
-        if not math.isfinite(offset) or offset < 0.0 or offset >= 1.0:
-            raise ValueError("leg phase offsets must be between 0.0 and less than 1.0")
-    if len(design.keyframes) < 2:
-        raise ValueError("leg motion design requires at least two keyframes")
-    phases: set[float] = set()
-    for keyframe in design.keyframes:
-        if not math.isfinite(keyframe.phase) or keyframe.phase < 0.0 or keyframe.phase >= 1.0:
-            raise ValueError("leg keyframe phase must be between 0.0 and less than 1.0")
-        rounded_phase = round(keyframe.phase, 6)
-        if rounded_phase in phases:
-            raise ValueError(f"duplicate leg keyframe phase: {keyframe.phase:.3f}")
-        phases.add(rounded_phase)
-        for value in (keyframe.yaw, keyframe.lift, keyframe.knee):
-            if not math.isfinite(value) or value < -1.0 or value > 1.0:
-                raise ValueError("leg keyframe joint values must be between -1 and 1")
-        if (
-            not math.isfinite(keyframe.duration_seconds)
-            or keyframe.duration_seconds < 0.02
-            or keyframe.duration_seconds > 20.0
-        ):
-            raise ValueError(
-                "time to the next leg frame must be between 0.02 and 20 seconds"
-            )
-
-
-def evaluate_leg_motion(design: LegMotionDesign, phase: float) -> tuple[float, float, float]:
-    normalized_phase = phase % 1.0
-    keyframes = sorted(design.keyframes, key=lambda item: item.phase)
-    extended = [
-        LegMotionKeyframe(
-            keyframes[-1].phase - 1.0,
-            keyframes[-1].yaw,
-            keyframes[-1].lift,
-            keyframes[-1].knee,
-        ),
-        *keyframes,
-        LegMotionKeyframe(
-            keyframes[0].phase + 1.0,
-            keyframes[0].yaw,
-            keyframes[0].lift,
-            keyframes[0].knee,
-        ),
-    ]
-    start = extended[0]
-    end = extended[1]
-    for candidate_start, candidate_end in zip(extended, extended[1:]):
-        if candidate_start.phase <= normalized_phase <= candidate_end.phase:
-            start, end = candidate_start, candidate_end
-            break
-    span = end.phase - start.phase
-    progress = 0.0 if span <= 0.0 else (normalized_phase - start.phase) / span
-    eased = 0.5 - 0.5 * math.cos(PI_F * max(0.0, min(1.0, progress)))
-    return tuple(
-        clip_unit(start_value + (end_value - start_value) * eased)
-        for start_value, end_value in (
-            (start.yaw, end.yaw),
-            (start.lift, end.lift),
-            (start.knee, end.knee),
-        )
-    )
-
-
-def leg_motion_zero_columns(
-    design: LegMotionDesign,
-    tolerance: float = 1e-6,
-) -> set[str]:
-    return {
-        joint
-        for joint in ("yaw", "lift", "knee")
-        if all(
-            abs(getattr(keyframe, joint)) <= tolerance
-            for keyframe in design.keyframes
-        )
-    }
-
-
-def load_leg_motion_designs(path: str) -> list[LegMotionDesign]:
-    design_path = Path(path)
-    if not design_path.exists():
-        return []
-    with design_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or data.get("format") != LEG_MOTION_FORMAT:
-        raise ValueError(f"unsupported leg motion design file: {path}")
-    if data.get("version") != LEG_MOTION_VERSION:
-        raise ValueError(f"unsupported leg motion design version: {data.get('version')!r}")
-    raw_designs = data.get("designs")
-    if not isinstance(raw_designs, list):
-        raise ValueError("leg motion design file designs must be an array")
-
-    designs: list[LegMotionDesign] = []
-    names: set[str] = set()
-    for raw_design in raw_designs:
-        if not isinstance(raw_design, dict):
-            raise ValueError("each leg motion design must be an object")
-        raw_keyframes = raw_design.get("keyframes")
-        raw_offsets = raw_design.get("phase_offsets")
-        if (
-            not isinstance(raw_design.get("name"), str)
-            or not isinstance(raw_keyframes, list)
-            or not isinstance(raw_offsets, list)
-        ):
-            raise ValueError("leg motion design requires name, keyframes, and phase_offsets")
-        if not all(isinstance(raw, dict) for raw in raw_keyframes):
-            raise ValueError("each leg keyframe must be an object")
-        if len(raw_keyframes) < 2:
-            raise ValueError("leg motion design requires at least two keyframes")
-        raw_phases = [
-            float(raw["phase"])
-            for raw in raw_keyframes
-        ]
-        frequency_hz = float(raw_design.get("frequency_hz", 0.25))
-        keyframes = []
-        for index, raw in enumerate(raw_keyframes):
-            next_phase = raw_phases[(index + 1) % len(raw_phases)]
-            phase_span = (next_phase - raw_phases[index]) % 1.0
-            if phase_span <= 0.0:
-                phase_span = 1.0 / max(1, len(raw_phases))
-            keyframes.append(
-                LegMotionKeyframe(
-                    phase=raw_phases[index],
-                    yaw=float(raw["yaw"]),
-                    lift=float(raw["lift"]),
-                    knee=float(raw["knee"]),
-                    duration_seconds=float(
-                        raw.get(
-                            "duration_seconds",
-                            phase_span / frequency_hz,
-                        )
-                    ),
-                )
-            )
-        design = LegMotionDesign(
-            name=raw_design["name"].strip(),
-            frequency_hz=frequency_hz,
-            keyframes=keyframes,
-            phase_offsets=[float(value) for value in raw_offsets],
-        )
-        update_leg_motion_timing(design)
-        validate_leg_motion_design(design)
-        if design.name in names:
-            raise ValueError(f"duplicate leg motion design name: {design.name}")
-        names.add(design.name)
-        designs.append(design)
-    return designs
-
-
-def save_leg_motion_designs(path: str, designs: list[LegMotionDesign]) -> None:
-    names: set[str] = set()
-    for design in designs:
-        update_leg_motion_timing(design)
-        validate_leg_motion_design(design)
-        if design.name in names:
-            raise ValueError(f"duplicate leg motion design name: {design.name}")
-        names.add(design.name)
-    data = {
-        "format": LEG_MOTION_FORMAT,
-        "version": LEG_MOTION_VERSION,
-        "designs": [
-            {
-                "name": design.name,
-                "frequency_hz": design.frequency_hz,
-                "keyframes": [
-                    {
-                        "phase": keyframe.phase,
-                        "yaw": keyframe.yaw,
-                        "lift": keyframe.lift,
-                        "knee": keyframe.knee,
-                        "duration_seconds": keyframe.duration_seconds,
-                    }
-                    for keyframe in design.keyframes
-                ],
-                "phase_offsets": design.phase_offsets,
-            }
-            for design in designs
         ],
     }
     output_path = Path(path)
@@ -1574,11 +1430,6 @@ class HanachanCPGController:
         self.body_tick_overrides: dict[int, int] = {}
         self.gait_test_mode = "full"
         self.motion_source = "cpg"
-        self.leg_motion_design: LegMotionDesign | None = None
-        self.leg_motion_preview_index: int | None = None
-        self.leg_motion_phase = 0.0
-        self.leg_motion_controlled_indices: set[int] = set()
-        self.leg_motion_hold_targets: dict[int, int] = {}
 
     def set_gait_test_mode(self, mode: str) -> None:
         if mode not in GAIT_TEST_MODES:
@@ -1611,56 +1462,6 @@ class HanachanCPGController:
         if high <= low:
             raise ValueError(f"invalid joint limits for {JOINT_LABELS[index]}")
         return clip_unit(2.0 * (radians - low) / (high - low) - 1.0)
-
-    def leg_is_enabled(self, leg_index: int) -> bool:
-        leg = LEGS[leg_index]
-        enabled = set(self.config.enabled_indices)
-        return all(
-            index in enabled
-            for index in (leg.yaw_index, leg.lift_index, leg.knee_index)
-        )
-
-    def read_leg_semantic_pose(self, leg_index: int) -> tuple[float, float, float]:
-        if not self.leg_is_enabled(leg_index):
-            raise ValueError(f"leg {leg_index + 1} is disabled")
-        leg = LEGS[leg_index]
-        yaw_action = self.raw_tick_to_normalized(
-            leg.yaw_index,
-            self.bus.read_position(self.config.ids[leg.yaw_index]),
-        )
-        lift_action = self.raw_tick_to_normalized(
-            leg.lift_index,
-            self.bus.read_position(self.config.ids[leg.lift_index]),
-        )
-        knee_action = self.raw_tick_to_normalized(
-            leg.knee_index,
-            self.bus.read_position(self.config.ids[leg.knee_index]),
-        )
-        return (
-            clip_unit(yaw_action / leg.side_sign),
-            clip_unit(lift_action / (-leg.side_sign)),
-            clip_unit(knee_action),
-        )
-
-    def set_leg_torque(self, leg_index: int, enabled: bool) -> None:
-        if not self.leg_is_enabled(leg_index):
-            raise ValueError(f"leg {leg_index + 1} is disabled")
-        leg = LEGS[leg_index]
-        for index in (leg.yaw_index, leg.lift_index, leg.knee_index):
-            self.bus.set_torque(self.config.ids[index], enabled)
-
-    def enable_leg_torque_at_current_position(self, leg_index: int) -> None:
-        if not self.leg_is_enabled(leg_index):
-            raise ValueError(f"leg {leg_index + 1} is disabled")
-        leg = LEGS[leg_index]
-        indices = (leg.yaw_index, leg.lift_index, leg.knee_index)
-        current_targets = {
-            self.config.ids[index]: self.bus.read_position(self.config.ids[index])
-            for index in indices
-        }
-        self.bus.sync_move_to(current_targets)
-        for index in indices:
-            self.bus.set_torque(self.config.ids[index], True)
 
     def filter_params(self, dt: float) -> None:
         alpha = dt / (ACTION_FILTER_TAU + dt)
@@ -1736,14 +1537,23 @@ class HanachanCPGController:
                 foot_rise = 0.0
                 knee_rise = 0.0
 
-            # Positive turn lengthens the left stride and shortens the right one.
-            turn_gain = 1.0 + turn * (1.0 if leg.side_index == 0 else -1.0)
-            hip = leg_swing * stroke + clearance * foot_rise
+            # Differential drive. Scaling one side down can only pivot around a
+            # standing side; spinning on the spot needs that side to stroke the
+            # other way, so the drive term is allowed to go negative:
+            #   turn 0     both sides +1        straight
+            #   turn 0.5   left +1, right 0     pivot about the right legs
+            #   turn 1     left +1, right -1    rotate in place
+            side = 1.0 if leg.side_index == 0 else -1.0
+            drive = (1.0 - abs(turn)) + turn * side
+
+            # Only the fore-aft stroke reverses. Foot clearance must keep
+            # lifting the leg whichever way it is travelling.
+            hip = leg_swing * drive * stroke + clearance * foot_rise
 
             self.servo_action[leg.yaw_index] = clip_unit(
-                leg.side_sign * (stride_bias + stride * turn_gain * yaw_stroke)
+                leg.side_sign * (stride_bias + stride * drive * yaw_stroke)
             )
-            knee_hip = leg_swing * knee_stroke + clearance * knee_rise
+            knee_hip = leg_swing * drive * knee_stroke + clearance * knee_rise
 
             self.servo_action[leg.lift_index] = clip_unit(-leg.side_sign * (lift_bias + hip))
             self.servo_action[leg.knee_index] = clip_unit(
@@ -1809,44 +1619,12 @@ class HanachanCPGController:
             body_wave = body_amp * math.sin(body_phase) if self.gait_test_mode == "full" else 0.0
             self.servo_action[BODY_JOINT_INDEX[i]] = clip_unit(body_turn_bias + body_wave)
 
-    def compute_leg_motion_action(self, dt: float) -> None:
-        design = self.leg_motion_design
-        if design is None:
-            raise RuntimeError("leg motion design is not selected")
-        self.servo_action = [0.0] * SERVO_COUNT
-        self.leg_motion_phase = (
-            self.leg_motion_phase + design.frequency_hz * dt
-        ) % 1.0
-        for leg_index, leg in enumerate(LEGS):
-            if not self.leg_is_enabled(leg_index):
-                continue
-            if (
-                self.leg_motion_preview_index is not None
-                and leg_index != self.leg_motion_preview_index
-            ):
-                continue
-            phase = (
-                self.leg_motion_phase + design.phase_offsets[leg_index]
-            ) % 1.0
-            yaw, lift, knee = evaluate_leg_motion(design, phase)
-            self.servo_action[leg.yaw_index] = clip_unit(leg.side_sign * yaw)
-            self.servo_action[leg.lift_index] = clip_unit(-leg.side_sign * lift)
-            self.servo_action[leg.knee_index] = clip_unit(leg.side_sign * knee)
-
     def targets_from_action(self) -> dict[int, int]:
         targets: dict[int, int] = {}
         indices = self.config.enabled_indices
-        if self.motion_source == "leg-template":
-            indices = [
-                index
-                for index in self.config.enabled_indices
-                if index in self.leg_motion_controlled_indices
-            ]
         for index in indices:
             dxl_id = self.config.ids[index]
-            if dxl_id in self.leg_motion_hold_targets:
-                targets[dxl_id] = self.leg_motion_hold_targets[dxl_id]
-            elif index in self.body_tick_overrides:
+            if index in self.body_tick_overrides:
                 targets[dxl_id] = self.body_tick_overrides[index]
             else:
                 radians = self.normalized_to_rad(index, self.servo_action[index])
@@ -1911,53 +1689,10 @@ class HanachanCPGController:
 
     def start_motion(self) -> None:
         self.motion_source = "cpg"
-        self.leg_motion_controlled_indices.clear()
-        self.leg_motion_hold_targets.clear()
         self.motion_enabled = True
         self.phase_rad = 0.0
         self.body_phase_rad = 0.0
         self.filtered_params = [clip_unit(value) for value in self.gait_params]
-
-    def start_leg_motion(
-        self,
-        design: LegMotionDesign,
-        preview_leg_index: int | None = None,
-    ) -> None:
-        update_leg_motion_timing(design)
-        validate_leg_motion_design(design)
-        if preview_leg_index is not None and not self.leg_is_enabled(preview_leg_index):
-            raise ValueError(f"leg {preview_leg_index + 1} is disabled")
-        controlled_leg_indices = [
-            leg_index
-            for leg_index in range(LEG_COUNT)
-            if self.leg_is_enabled(leg_index)
-            and (
-                preview_leg_index is None
-                or leg_index == preview_leg_index
-            )
-        ]
-        controlled_indices: set[int] = set()
-        hold_targets: dict[int, int] = {}
-        zero_columns = leg_motion_zero_columns(design)
-        for leg_index in controlled_leg_indices:
-            leg = LEGS[leg_index]
-            joint_indices = {
-                "yaw": leg.yaw_index,
-                "lift": leg.lift_index,
-                "knee": leg.knee_index,
-            }
-            controlled_indices.update(joint_indices.values())
-            for joint in zero_columns:
-                index = joint_indices[joint]
-                dxl_id = self.config.ids[index]
-                hold_targets[dxl_id] = self.bus.read_position(dxl_id)
-        self.motion_source = "leg-template"
-        self.leg_motion_design = design
-        self.leg_motion_preview_index = preview_leg_index
-        self.leg_motion_controlled_indices = controlled_indices
-        self.leg_motion_hold_targets = hold_targets
-        self.leg_motion_phase = 0.0
-        self.motion_enabled = True
 
     def stop_motion_neutral(self) -> None:
         self.motion_enabled = False
@@ -1999,11 +1734,8 @@ class HanachanCPGController:
             dt = expected_period
         if not self.motion_enabled:
             return
-        if self.motion_source == "leg-template":
-            self.compute_leg_motion_action(dt)
-        else:
-            self.filter_params(dt)
-            self.compute_servo_action(dt)
+        self.filter_params(dt)
+        self.compute_servo_action(dt)
         self.write_targets()
 
 
@@ -2016,7 +1748,6 @@ class CPGGui:
         config: RobotConfig,
         output_path: str,
         preset_path: str,
-        leg_design_path: str,
         skip_init: bool,
         skip_position_mode: bool,
         torque_on: bool,
@@ -2054,8 +1785,9 @@ class CPGGui:
             self.controller = HanachanCPGController(self.bus, config, gait_model)
         self.output_path = output_path
         self.preset_path = preset_path
-        self.leg_design_path = leg_design_path
         self.preset_load_error: str | None = None
+        self.motion_teaching = None
+        self.motion_output_path = DEFAULT_MOTION_LIBRARY
         try:
             self.gait_presets = load_gait_presets(preset_path)
         except Exception as exc:
@@ -2076,7 +1808,6 @@ class CPGGui:
         self.gait_test_mode_var = tk.StringVar(value="Full gait")
         self.preset_name_var = tk.StringVar()
         self.preset_combo = None
-        self.leg_motion_designer = None
         # The parameter sliders live only in the advanced panel, so show it by default.
         self.show_advanced_var = tk.BooleanVar(value=True)
         self.advanced_container = None
@@ -2162,8 +1893,8 @@ class CPGGui:
         ).pack(side=tk.LEFT, padx=(18, 0))
         ttk.Button(
             quick_presets,
-            text="Leg Motion Designer...",
-            command=self.open_leg_motion_designer,
+            text="Motion Teaching...",
+            command=self.open_motion_teaching,
         ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(
             quick_presets,
@@ -2366,6 +2097,39 @@ class CPGGui:
         else:
             self.advanced_container.pack_forget()
 
+    def open_motion_teaching(self) -> None:
+        if self.onboard_cpg:
+            self.messagebox.showinfo(
+                "Motion Teaching",
+                "Motion teaching needs direct bus access; drop --onboard-cpg.",
+            )
+            return
+        if (
+            self.motion_teaching is not None
+            and self.motion_teaching.root.winfo_exists()
+        ):
+            self.motion_teaching.root.lift()
+            self.motion_teaching.root.focus_force()
+            return
+        try:
+            # Teaching goes torque-free, so the gait must not be driving.
+            self.cancel_initial_position()
+            self.controller.motion_enabled = False
+            self.motion_teaching = MotionTeachingGui(
+                device="",
+                baudrate=0,
+                protocol=0.0,
+                config=self.config,
+                input_path="",
+                output_path=self.motion_output_path,
+                owner=self,
+                bus=self.bus,
+            )
+            self.motion_teaching.run()
+            self.status_var.set("Motion teaching window opened; torque is off.")
+        except Exception as exc:
+            self.status_var.set(f"Error: {exc}")
+
     def toggle_body_positions(self) -> None:
         if self.body_container is None:
             return
@@ -2373,27 +2137,6 @@ class CPGGui:
             self.body_container.pack(fill=self.tk.X, pady=(6, 0))
         else:
             self.body_container.pack_forget()
-
-    def open_leg_motion_designer(self) -> None:
-        if self.onboard_cpg:
-            self.messagebox.showinfo(
-                "Leg Motion Designer",
-                "Leg Motion Designer is currently available in wired PC control mode.",
-            )
-            return
-        if (
-            self.leg_motion_designer is not None
-            and self.leg_motion_designer.window.winfo_exists()
-        ):
-            self.leg_motion_designer.window.lift()
-            self.leg_motion_designer.window.focus_force()
-            return
-        self.leg_motion_designer = LegMotionDesignerWindow(
-            owner=self,
-            controller=self.controller,
-            config=self.config,
-            design_path=self.leg_design_path,
-        )
 
     def update_param_label(self, index: int) -> None:
         normalized = self.param_vars[index].get()
@@ -2742,10 +2485,13 @@ class CPGGui:
 
     def close(self) -> None:
         self.closed = True
-        if self.leg_motion_designer is not None:
-            self.leg_motion_designer.close()
         self.cancel_initial_position()
         self.cancel_pending_body_ticks()
+        if self.motion_teaching is not None:
+            try:
+                self.motion_teaching.close()
+            except Exception:
+                pass
         if self.torque_off_exit:
             try:
                 self.controller.set_torque(False)
@@ -2753,963 +2499,6 @@ class CPGGui:
                 pass
         self.bus.__exit__(None, None, None)
         self.root.destroy()
-
-
-class LegMotionDesignerWindow:
-    def __init__(
-        self,
-        owner: CPGGui,
-        controller: HanachanCPGController,
-        config: RobotConfig,
-        design_path: str,
-    ) -> None:
-        tk = owner.tk
-        ttk = owner.ttk
-        self.tk = tk
-        self.ttk = ttk
-        self.messagebox = owner.messagebox
-        self.owner = owner
-        self.controller = controller
-        self.config = config
-        self.design_path = design_path
-        self.window = tk.Toplevel(owner.root)
-        self.window.title("Hanachan Leg Motion Designer")
-        self.window.geometry("1160x860")
-        self.window.minsize(960, 700)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        self.closed = False
-        self.manual_torque_off = False
-        self.manual_torque_off_leg_index: int | None = None
-        self.recording = False
-        self.recording_leg_index: int | None = None
-        self.recording_started_at = 0.0
-        self.recording_samples: list[
-            tuple[float, tuple[float, float, float]]
-        ] = []
-        self.recording_after: str | None = None
-
-        self.design_load_error: str | None = None
-        try:
-            self.designs = load_leg_motion_designs(design_path)
-        except Exception as exc:
-            self.designs = []
-            self.design_load_error = str(exc)
-        self.current_design = copy.deepcopy(
-            self.designs[0] if self.designs else default_leg_motion_design()
-        )
-
-        self.design_name_var = tk.StringVar(value=self.current_design.name)
-        self.frequency_var = tk.DoubleVar(value=self.current_design.frequency_hz)
-        self.frequency_label_var = tk.StringVar()
-        self.duration_var = tk.DoubleVar(value=0.25)
-        self.yaw_var = tk.DoubleVar(value=0.0)
-        self.lift_var = tk.DoubleVar(value=0.0)
-        self.knee_var = tk.DoubleVar(value=0.0)
-        self.frequency_callback_ready = False
-        self.batch_start_var = tk.IntVar(value=1)
-        self.batch_end_var = tk.IntVar(value=len(self.current_design.keyframes))
-        self.batch_joint_var = tk.StringVar(value="Yaw")
-        self.batch_operation_var = tk.StringVar(value="Set")
-        self.batch_value_a_var = tk.StringVar(value="0.0")
-        self.batch_value_b_var = tk.StringVar(value="0.0")
-        self.status_var = tk.StringVar()
-        self.phase_vars: dict[int, tk.DoubleVar] = {}
-        self.phase_value_vars: dict[int, tk.StringVar] = {}
-        self.tree = None
-        self.design_combo = None
-
-        self.active_leg_indices = [
-            index for index in range(LEG_COUNT) if controller.leg_is_enabled(index)
-        ]
-        if not self.active_leg_indices:
-            raise RuntimeError("No complete three-joint legs are enabled.")
-        self.leg_labels = {
-            index: self.leg_label(index) for index in self.active_leg_indices
-        }
-        self.source_leg_var = tk.StringVar(
-            value=self.leg_labels[self.active_leg_indices[0]]
-        )
-        self.build_widgets()
-        self.load_design_into_widgets()
-
-    @staticmethod
-    def leg_label(leg_index: int) -> str:
-        leg = LEGS[leg_index]
-        side = "Left" if leg.side_index == 0 else "Right"
-        return f"Leg {leg.segment_index + 1} {side}"
-
-    def selected_leg_index(self) -> int:
-        selected = self.source_leg_var.get()
-        for index, label in self.leg_labels.items():
-            if label == selected:
-                return index
-        raise ValueError("Select a leg.")
-
-    def build_widgets(self) -> None:
-        tk = self.tk
-        ttk = self.ttk
-        outer = ttk.Frame(self.window, padding=12)
-        outer.pack(fill=tk.BOTH, expand=True)
-
-        library = ttk.LabelFrame(outer, text="Leg motion design", padding=8)
-        library.pack(fill=tk.X)
-        ttk.Label(library, text="Name:").pack(side=tk.LEFT)
-        self.design_combo = ttk.Combobox(
-            library,
-            textvariable=self.design_name_var,
-            values=[design.name for design in self.designs],
-            width=28,
-        )
-        self.design_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 8))
-        ttk.Button(library, text="New", command=self.new_design).pack(side=tk.LEFT)
-        ttk.Button(library, text="Load", command=self.load_selected_design).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(library, text="Save", command=self.save_current_design).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(library, text="Delete", command=self.delete_selected_design).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-
-        motion = ttk.LabelFrame(outer, text="Cycle and source leg", padding=8)
-        motion.pack(fill=tk.X, pady=(8, 0))
-        motion.columnconfigure(1, weight=1)
-        ttk.Label(motion, text="Frequency", width=16).grid(row=0, column=0, sticky="w")
-        tk.Scale(
-            motion,
-            from_=0.05,
-            to=2.00,
-            resolution=0.01,
-            orient=tk.HORIZONTAL,
-            showvalue=False,
-            variable=self.frequency_var,
-            command=self.frequency_changed,
-        ).grid(row=0, column=1, sticky="ew")
-        ttk.Label(motion, textvariable=self.frequency_label_var, width=20).grid(
-            row=0, column=2, sticky="e"
-        )
-        ttk.Label(motion, text="Edit / preview leg", width=16).grid(
-            row=1, column=0, sticky="w", pady=(6, 0)
-        )
-        ttk.Combobox(
-            motion,
-            textvariable=self.source_leg_var,
-            values=[self.leg_labels[index] for index in self.active_leg_indices],
-            state="readonly",
-            width=20,
-        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        manual = ttk.Frame(motion)
-        manual.grid(row=1, column=2, sticky="e", pady=(6, 0))
-        ttk.Button(manual, text="Torque Off leg", command=self.torque_off_selected_leg).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(manual, text="Capture pose", command=self.capture_current_pose).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(manual, text="Torque On leg", command=self.torque_on_selected_leg).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        recording = ttk.Frame(motion)
-        recording.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Label(recording, text="Continuous teaching", width=16).pack(side=tk.LEFT)
-        ttk.Button(
-            recording,
-            text="Start recording",
-            command=self.start_continuous_recording,
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            recording,
-            text="Finish recording",
-            command=self.finish_continuous_recording,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(
-            recording,
-            text="Cancel recording",
-            command=self.cancel_continuous_recording,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(
-            recording,
-            text="Move the torque-free leg through exactly one cycle.",
-        ).pack(side=tk.LEFT, padx=(12, 0))
-
-        middle = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
-        middle.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        editor = ttk.LabelFrame(middle, text="Single-leg keyframes", padding=8)
-        transfer = ttk.LabelFrame(middle, text="Transfer phase per leg", padding=8)
-        middle.add(editor, weight=3)
-        middle.add(transfer, weight=2)
-
-        columns = ("frame", "phase", "duration", "yaw", "lift", "knee")
-        self.tree = ttk.Treeview(editor, columns=columns, show="headings", height=9)
-        for column, text, width in (
-            ("frame", "Frame", 58),
-            ("phase", "Phase", 65),
-            ("duration", "To next", 75),
-            ("yaw", "Yaw", 65),
-            ("lift", "Lift", 65),
-            ("knee", "Knee", 65),
-        ):
-            self.tree.heading(column, text=text)
-            self.tree.column(column, width=width, anchor=tk.CENTER)
-        self.tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
-        self.tree.bind("<<TreeviewSelect>>", self.keyframe_selected)
-        editor.rowconfigure(0, weight=1)
-        editor.columnconfigure(1, weight=1)
-
-        for row, (label, variable, low, high, resolution) in enumerate(
-            (
-                ("To next (s)", self.duration_var, 0.02, 5.0, 0.01),
-                ("Yaw", self.yaw_var, -1.0, 1.0, 0.01),
-                ("Lift", self.lift_var, -1.0, 1.0, 0.01),
-                ("Knee", self.knee_var, -1.0, 1.0, 0.01),
-            ),
-            start=1,
-        ):
-            ttk.Label(editor, text=label, width=12).grid(row=row, column=0, sticky="w")
-            tk.Scale(
-                editor,
-                from_=low,
-                to=high,
-                resolution=resolution,
-                orient=tk.HORIZONTAL,
-                variable=variable,
-            ).grid(row=row, column=1, columnspan=3, sticky="ew")
-
-        actions = ttk.Frame(editor)
-        actions.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        ttk.Button(actions, text="Add frame after selected", command=self.add_keyframe).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(actions, text="Update frame / time", command=self.update_keyframe).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(actions, text="Delete frame", command=self.delete_keyframe).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-
-        batch = ttk.LabelFrame(editor, text="Batch edit frame range", padding=6)
-        batch.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Label(batch, text="Frames").grid(row=0, column=0, sticky="w")
-        tk.Spinbox(
-            batch,
-            from_=1,
-            to=9999,
-            width=5,
-            textvariable=self.batch_start_var,
-        ).grid(row=0, column=1, padx=(4, 0))
-        ttk.Label(batch, text="to").grid(row=0, column=2, padx=4)
-        tk.Spinbox(
-            batch,
-            from_=1,
-            to=9999,
-            width=5,
-            textvariable=self.batch_end_var,
-        ).grid(row=0, column=3)
-        ttk.Button(
-            batch,
-            text="Use selected rows",
-            command=self.use_selected_batch_range,
-        ).grid(row=0, column=4, padx=(6, 12))
-        ttk.Label(batch, text="Column").grid(row=0, column=5)
-        ttk.Combobox(
-            batch,
-            textvariable=self.batch_joint_var,
-            values=("Yaw", "Lift", "Knee", "To next"),
-            state="readonly",
-            width=7,
-        ).grid(row=0, column=6, padx=(4, 0))
-
-        ttk.Label(batch, text="Operation").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Combobox(
-            batch,
-            textvariable=self.batch_operation_var,
-            values=("Set", "Add", "Multiply", "Linear ramp"),
-            state="readonly",
-            width=12,
-        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(4, 0), pady=(6, 0))
-        ttk.Label(batch, text="Value / start").grid(
-            row=1, column=3, sticky="e", padx=(8, 4), pady=(6, 0)
-        )
-        ttk.Entry(batch, textvariable=self.batch_value_a_var, width=8).grid(
-            row=1, column=4, sticky="w", pady=(6, 0)
-        )
-        ttk.Label(batch, text="Ramp end").grid(
-            row=1, column=5, sticky="e", padx=(8, 4), pady=(6, 0)
-        )
-        ttk.Entry(batch, textvariable=self.batch_value_b_var, width=8).grid(
-            row=1, column=6, sticky="w", pady=(6, 0)
-        )
-        ttk.Button(batch, text="Apply batch edit", command=self.apply_batch_edit).grid(
-            row=1, column=7, padx=(10, 0), pady=(6, 0)
-        )
-        ttk.Button(
-            batch,
-            text="Delete frame range",
-            command=self.delete_batch_range,
-        ).grid(row=0, column=7, padx=(10, 0))
-
-        transfer.columnconfigure(1, weight=1)
-        for row, leg_index in enumerate(self.active_leg_indices):
-            ttk.Label(transfer, text=self.leg_labels[leg_index], width=16).grid(
-                row=row, column=0, sticky="w"
-            )
-            variable = tk.DoubleVar()
-            value_var = tk.StringVar()
-            self.phase_vars[leg_index] = variable
-            self.phase_value_vars[leg_index] = value_var
-            tk.Scale(
-                transfer,
-                from_=0.0,
-                to=0.99,
-                resolution=0.01,
-                showvalue=False,
-                orient=tk.HORIZONTAL,
-                variable=variable,
-                command=lambda _value, index=leg_index: self.phase_offset_changed(index),
-            ).grid(row=row, column=1, sticky="ew")
-            ttk.Label(transfer, textvariable=value_var, width=14).grid(
-                row=row, column=2, sticky="e"
-            )
-
-        phase_presets = ttk.Frame(transfer)
-        phase_presets.grid(
-            row=len(self.active_leg_indices),
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            pady=(8, 0),
-        )
-        ttk.Button(
-            phase_presets,
-            text="Tripod",
-            command=lambda: self.apply_phase_preset("tripod"),
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            phase_presets,
-            text="Wave",
-            command=lambda: self.apply_phase_preset("wave"),
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(
-            phase_presets,
-            text="All together",
-            command=lambda: self.apply_phase_preset("together"),
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        run = ttk.Frame(outer)
-        run.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(run, text="Preview selected leg", command=self.preview_selected_leg).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(run, text="Run all legs", command=self.run_all_legs).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(run, text="Stop / Neutral", command=self.stop_motion).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Label(run, textvariable=self.status_var).pack(side=tk.LEFT, padx=(12, 0))
-
-    def frequency_changed(self, _value: str | None = None) -> None:
-        requested_frequency = self.frequency_var.get()
-        if self.frequency_callback_ready and self.current_design.keyframes:
-            current_duration = sum(
-                keyframe.duration_seconds
-                for keyframe in self.current_design.keyframes
-            )
-            target_duration = 1.0 / requested_frequency
-            scale = target_duration / current_duration
-            for keyframe in self.current_design.keyframes:
-                keyframe.duration_seconds *= scale
-            update_leg_motion_timing(self.current_design)
-            self.refresh_keyframes(self.selected_keyframe_index())
-        else:
-            self.current_design.frequency_hz = requested_frequency
-        self.frequency_label_var.set(
-            f"{self.current_design.frequency_hz:.2f} Hz / "
-            f"{1.0 / self.current_design.frequency_hz:.2f} s"
-        )
-
-    def sync_frequency_from_frame_times(self) -> None:
-        update_leg_motion_timing(self.current_design)
-        self.frequency_callback_ready = False
-        self.frequency_var.set(self.current_design.frequency_hz)
-        self.frequency_label_var.set(
-            f"{self.current_design.frequency_hz:.2f} Hz / "
-            f"{1.0 / self.current_design.frequency_hz:.2f} s"
-        )
-        self.frequency_callback_ready = True
-
-    def refresh_design_names(self) -> None:
-        if self.design_combo is not None:
-            self.design_combo.configure(values=[design.name for design in self.designs])
-
-    def load_design_into_widgets(self) -> None:
-        self.design_name_var.set(self.current_design.name)
-        self.sync_frequency_from_frame_times()
-        self.batch_start_var.set(1)
-        self.batch_end_var.set(len(self.current_design.keyframes))
-        for leg_index, variable in self.phase_vars.items():
-            variable.set(self.current_design.phase_offsets[leg_index])
-            self.update_phase_label(leg_index)
-        self.refresh_keyframes()
-        if self.design_load_error:
-            self.status_var.set(f"File error: {self.design_load_error}")
-        else:
-            self.status_var.set("Edit one cycle, then preview one leg before running all legs.")
-
-    def refresh_keyframes(self, selected: int | None = None) -> None:
-        if self.tree is None:
-            return
-        self.tree.delete(*self.tree.get_children())
-        for index, keyframe in enumerate(self.current_design.keyframes):
-            self.tree.insert(
-                "",
-                self.tk.END,
-                iid=str(index),
-                values=(
-                    index + 1,
-                    f"{keyframe.phase:.2f}",
-                    f"{keyframe.duration_seconds:.2f} s",
-                    f"{keyframe.yaw:+.2f}",
-                    f"{keyframe.lift:+.2f}",
-                    f"{keyframe.knee:+.2f}",
-                ),
-            )
-        if selected is not None and 0 <= selected < len(self.current_design.keyframes):
-            self.tree.selection_set(str(selected))
-            self.tree.focus(str(selected))
-
-    def selected_keyframe_index(self) -> int | None:
-        if self.tree is None or not self.tree.selection():
-            return None
-        return int(self.tree.selection()[0])
-
-    def keyframe_from_editor(self) -> LegMotionKeyframe:
-        return LegMotionKeyframe(
-            phase=0.0,
-            yaw=clip_unit(self.yaw_var.get()),
-            lift=clip_unit(self.lift_var.get()),
-            knee=clip_unit(self.knee_var.get()),
-            duration_seconds=max(0.02, min(20.0, self.duration_var.get())),
-        )
-
-    def keyframe_selected(self, _event=None) -> None:
-        index = self.selected_keyframe_index()
-        if index is None:
-            return
-        keyframe = self.current_design.keyframes[index]
-        self.duration_var.set(keyframe.duration_seconds)
-        self.yaw_var.set(keyframe.yaw)
-        self.lift_var.set(keyframe.lift)
-        self.knee_var.set(keyframe.knee)
-
-    def add_keyframe(self) -> None:
-        try:
-            keyframe = self.keyframe_from_editor()
-            selected = self.selected_keyframe_index()
-            insert_at = (
-                len(self.current_design.keyframes)
-                if selected is None
-                else selected + 1
-            )
-            self.current_design.keyframes.insert(insert_at, keyframe)
-            self.sync_frequency_from_frame_times()
-            validate_leg_motion_design(self.current_design)
-            self.refresh_keyframes(insert_at)
-            self.status_var.set(
-                f"Added frame {insert_at + 1}; "
-                f"time to its next frame is {keyframe.duration_seconds:.2f} s."
-            )
-        except Exception as exc:
-            self.messagebox.showerror("Add frame", str(exc))
-
-    def update_keyframe(self) -> None:
-        index = self.selected_keyframe_index()
-        if index is None:
-            self.messagebox.showerror("Update keyframe", "Select a keyframe first.")
-            return
-        previous = self.current_design.keyframes[index]
-        self.current_design.keyframes[index] = self.keyframe_from_editor()
-        try:
-            self.sync_frequency_from_frame_times()
-            validate_leg_motion_design(self.current_design)
-            self.refresh_keyframes(index)
-            self.status_var.set(
-                f"Updated frame {index + 1} and recalculated the cycle timing."
-            )
-        except Exception as exc:
-            self.current_design.keyframes[index] = previous
-            self.sync_frequency_from_frame_times()
-            self.messagebox.showerror("Update frame", str(exc))
-
-    def delete_keyframe(self) -> None:
-        index = self.selected_keyframe_index()
-        if index is None:
-            return
-        if len(self.current_design.keyframes) <= 2:
-            self.messagebox.showerror(
-                "Delete keyframe",
-                "At least two keyframes are required.",
-            )
-            return
-        removed = self.current_design.keyframes.pop(index)
-        self.sync_frequency_from_frame_times()
-        self.refresh_keyframes()
-        self.status_var.set(
-            f"Deleted frame {index + 1} "
-            f"({removed.duration_seconds:.2f} s to next)."
-        )
-
-    def use_selected_batch_range(self) -> None:
-        if self.tree is None:
-            return
-        selected = [int(item) for item in self.tree.selection()]
-        if not selected:
-            self.messagebox.showerror(
-                "Batch edit",
-                "Select one or more frame rows first.",
-            )
-            return
-        self.batch_start_var.set(min(selected) + 1)
-        self.batch_end_var.set(max(selected) + 1)
-        self.status_var.set(
-            f"Batch range set to frames {min(selected) + 1}–{max(selected) + 1}."
-        )
-
-    def apply_batch_edit(self) -> None:
-        if self.recording:
-            self.messagebox.showerror(
-                "Batch edit",
-                "Finish or cancel continuous recording first.",
-            )
-            return
-        if self.controller.motion_enabled:
-            self.messagebox.showerror(
-                "Batch edit",
-                "Stop the motion before applying a batch edit.",
-            )
-            return
-        previous = copy.deepcopy(self.current_design.keyframes)
-        try:
-            start_index = int(self.batch_start_var.get()) - 1
-            end_index = int(self.batch_end_var.get()) - 1
-            operation = {
-                "Set": "set",
-                "Add": "add",
-                "Multiply": "multiply",
-                "Linear ramp": "ramp",
-            }[self.batch_operation_var.get()]
-            value_a = float(self.batch_value_a_var.get())
-            value_b = (
-                float(self.batch_value_b_var.get())
-                if operation == "ramp"
-                else None
-            )
-            joint = {
-                "Yaw": "yaw",
-                "Lift": "lift",
-                "Knee": "knee",
-                "To next": "duration_seconds",
-            }[self.batch_joint_var.get()]
-            batch_edit_leg_motion_keyframes(
-                self.current_design,
-                start_index,
-                end_index,
-                joint,
-                operation,
-                value_a,
-                value_b,
-            )
-            validate_leg_motion_design(self.current_design)
-            if joint == "duration_seconds":
-                self.sync_frequency_from_frame_times()
-            self.refresh_keyframes()
-            if self.tree is not None:
-                self.tree.selection_set(
-                    *(str(index) for index in range(start_index, end_index + 1))
-                )
-            operation_text = self.batch_operation_var.get()
-            self.status_var.set(
-                f"{operation_text} applied to {self.batch_joint_var.get()} "
-                f"in frames {start_index + 1}–{end_index + 1}."
-            )
-        except Exception as exc:
-            self.current_design.keyframes = previous
-            self.refresh_keyframes()
-            self.messagebox.showerror("Batch edit", str(exc))
-
-    def delete_batch_range(self) -> None:
-        if self.recording:
-            self.messagebox.showerror(
-                "Delete frame range",
-                "Finish or cancel continuous recording first.",
-            )
-            return
-        if self.controller.motion_enabled:
-            self.messagebox.showerror(
-                "Delete frame range",
-                "Stop the motion before deleting frames.",
-            )
-            return
-        previous = copy.deepcopy(self.current_design.keyframes)
-        try:
-            start_index = int(self.batch_start_var.get()) - 1
-            end_index = int(self.batch_end_var.get()) - 1
-            if (
-                start_index < 0
-                or end_index >= len(self.current_design.keyframes)
-                or start_index > end_index
-            ):
-                raise ValueError("Select a valid frame range.")
-            if not self.messagebox.askyesno(
-                "Delete frame range",
-                f"Delete frames {start_index + 1}–{end_index + 1}?",
-            ):
-                return
-            deleted = delete_leg_motion_keyframe_range(
-                self.current_design,
-                start_index,
-                end_index,
-            )
-            validate_leg_motion_design(self.current_design)
-            self.sync_frequency_from_frame_times()
-            self.refresh_keyframes()
-            remaining = len(self.current_design.keyframes)
-            next_frame = min(start_index + 1, remaining)
-            self.batch_start_var.set(next_frame)
-            self.batch_end_var.set(next_frame)
-            if self.tree is not None:
-                self.tree.selection_set(str(next_frame - 1))
-            self.status_var.set(
-                f"Deleted {deleted} frames. {remaining} frames remain."
-            )
-        except Exception as exc:
-            self.current_design.keyframes = previous
-            self.sync_frequency_from_frame_times()
-            self.refresh_keyframes()
-            self.messagebox.showerror("Delete frame range", str(exc))
-
-    def phase_offset_changed(self, leg_index: int) -> None:
-        value = self.phase_vars[leg_index].get() % 1.0
-        self.current_design.phase_offsets[leg_index] = value
-        self.update_phase_label(leg_index)
-
-    def update_phase_label(self, leg_index: int) -> None:
-        value = self.phase_vars[leg_index].get() % 1.0
-        self.phase_value_vars[leg_index].set(f"{value:.2f} / {value * 360:.0f}°")
-
-    def apply_phase_preset(self, name: str) -> None:
-        if name == "tripod":
-            offsets = [0.00, 0.50, 0.50, 0.00, 0.00, 0.50, 0.50, 0.00]
-        elif name == "wave":
-            offsets = list(self.current_design.phase_offsets)
-            count = len(self.active_leg_indices)
-            for order, leg_index in enumerate(self.active_leg_indices):
-                offsets[leg_index] = order / count
-        elif name == "together":
-            offsets = [0.0] * LEG_COUNT
-        else:
-            raise ValueError(f"unknown phase preset: {name}")
-        self.current_design.phase_offsets = offsets
-        for leg_index, variable in self.phase_vars.items():
-            variable.set(offsets[leg_index])
-            self.update_phase_label(leg_index)
-        self.status_var.set(f"Applied {name} phase layout; sliders remain editable.")
-
-    def torque_off_selected_leg(self) -> None:
-        try:
-            if self.recording:
-                raise RuntimeError("Finish or cancel the current recording first.")
-            leg_index = self.selected_leg_index()
-            if (
-                self.manual_torque_off_leg_index is not None
-                and self.manual_torque_off_leg_index != leg_index
-            ):
-                raise RuntimeError(
-                    "Another leg is already torque-free. Turn its torque ON first."
-                )
-            self.stop_motion()
-            self.controller.set_leg_torque(leg_index, False)
-            self.manual_torque_off = True
-            self.manual_torque_off_leg_index = leg_index
-            self.status_var.set("Selected leg torque is OFF. Support the robot before posing.")
-        except Exception as exc:
-            self.messagebox.showerror("Torque Off leg", str(exc))
-
-    def torque_on_selected_leg(self) -> None:
-        try:
-            if self.recording:
-                raise RuntimeError("Finish or cancel the current recording first.")
-            leg_index = (
-                self.manual_torque_off_leg_index
-                if self.manual_torque_off_leg_index is not None
-                else self.selected_leg_index()
-            )
-            self.controller.enable_leg_torque_at_current_position(
-                leg_index
-            )
-            self.manual_torque_off = False
-            self.manual_torque_off_leg_index = None
-            self.status_var.set(
-                "Selected leg torque is ON; goals were synchronized to the current pose."
-            )
-        except Exception as exc:
-            self.messagebox.showerror("Torque On leg", str(exc))
-
-    def start_continuous_recording(self) -> None:
-        try:
-            if self.recording:
-                raise RuntimeError("Recording is already running.")
-            leg_index = self.selected_leg_index()
-            if (
-                self.manual_torque_off_leg_index is not None
-                and self.manual_torque_off_leg_index != leg_index
-            ):
-                raise RuntimeError(
-                    "Another leg is torque-free. Turn its torque ON before recording."
-                )
-            self.stop_motion()
-            if self.manual_torque_off_leg_index is None:
-                self.controller.set_leg_torque(leg_index, False)
-                self.manual_torque_off = True
-                self.manual_torque_off_leg_index = leg_index
-            self.recording = True
-            self.recording_leg_index = leg_index
-            self.recording_started_at = time.monotonic()
-            self.recording_samples = []
-            self.record_continuous_sample()
-        except Exception as exc:
-            self.messagebox.showerror("Start continuous teaching", str(exc))
-
-    def record_continuous_sample(self) -> None:
-        if not self.recording or self.recording_leg_index is None or self.closed:
-            return
-        try:
-            elapsed = time.monotonic() - self.recording_started_at
-            pose = self.controller.read_leg_semantic_pose(self.recording_leg_index)
-            self.recording_samples.append((elapsed, pose))
-            self.status_var.set(
-                f"Recording one cycle: {elapsed:.2f} s, "
-                f"{len(self.recording_samples)} samples"
-            )
-            self.recording_after = self.window.after(
-                50,
-                self.record_continuous_sample,
-            )
-        except Exception as exc:
-            self.cancel_continuous_recording(show_status=False)
-            self.messagebox.showerror("Continuous teaching", str(exc))
-
-    def stop_recording_timer(self) -> None:
-        if self.recording_after is not None:
-            try:
-                self.window.after_cancel(self.recording_after)
-            except Exception:
-                pass
-            self.recording_after = None
-
-    def finish_continuous_recording(self) -> None:
-        if not self.recording:
-            self.messagebox.showerror(
-                "Finish continuous teaching",
-                "Start recording first.",
-            )
-            return
-        previous_keyframes = copy.deepcopy(self.current_design.keyframes)
-        previous_frequency = self.current_design.frequency_hz
-        try:
-            if self.recording_leg_index is None:
-                raise RuntimeError("Recording leg is unavailable.")
-            duration = time.monotonic() - self.recording_started_at
-            final_pose = self.controller.read_leg_semantic_pose(
-                self.recording_leg_index
-            )
-            self.recording_samples.append((duration, final_pose))
-            self.recording = False
-            self.stop_recording_timer()
-            if duration < 0.5 or len(self.recording_samples) < 3:
-                raise ValueError(
-                    "Record at least 0.5 seconds so one cycle can be reconstructed."
-                )
-
-            recorded_frames = self.recording_samples[:-1]
-            keyframes = []
-            for index, (elapsed, pose) in enumerate(recorded_frames):
-                next_elapsed = self.recording_samples[index + 1][0]
-                keyframes.append(
-                    LegMotionKeyframe(
-                        phase=0.0,
-                        yaw=pose[0],
-                        lift=pose[1],
-                        knee=pose[2],
-                        duration_seconds=max(0.02, next_elapsed - elapsed),
-                    )
-                )
-            self.current_design.keyframes = keyframes
-            self.sync_frequency_from_frame_times()
-            validate_leg_motion_design(self.current_design)
-            self.refresh_keyframes()
-            self.recording_leg_index = None
-            self.status_var.set(
-                f"Captured your complete {duration:.2f} s cycle as "
-                f"{len(keyframes)} keyframes. Turn torque ON, then preview it."
-            )
-        except Exception as exc:
-            self.current_design.keyframes = previous_keyframes
-            self.current_design.frequency_hz = previous_frequency
-            self.sync_frequency_from_frame_times()
-            self.refresh_keyframes()
-            self.recording = False
-            self.recording_leg_index = None
-            self.stop_recording_timer()
-            self.messagebox.showerror("Finish continuous teaching", str(exc))
-
-    def cancel_continuous_recording(self, show_status: bool = True) -> None:
-        self.recording = False
-        self.recording_leg_index = None
-        self.recording_samples = []
-        self.stop_recording_timer()
-        if show_status:
-            self.status_var.set(
-                "Recording cancelled; the previous keyframes were kept."
-            )
-
-    def capture_current_pose(self) -> None:
-        try:
-            yaw, lift, knee = self.controller.read_leg_semantic_pose(
-                self.selected_leg_index()
-            )
-            self.yaw_var.set(yaw)
-            self.lift_var.set(lift)
-            self.knee_var.set(knee)
-            self.status_var.set("Captured current pose into the keyframe editor.")
-        except Exception as exc:
-            self.messagebox.showerror("Capture pose", str(exc))
-
-    def require_preview_ready(self) -> None:
-        if self.recording:
-            raise RuntimeError("Finish or cancel the recording before previewing.")
-        if self.manual_torque_off:
-            raise RuntimeError("Turn the selected leg torque ON before previewing.")
-        self.frequency_changed()
-        validate_leg_motion_design(self.current_design)
-
-    def preview_selected_leg(self) -> None:
-        try:
-            self.require_preview_ready()
-            self.owner.cancel_initial_position()
-            leg_index = self.selected_leg_index()
-            self.controller.start_leg_motion(self.current_design, leg_index)
-            self.status_var.set(f"Previewing {self.leg_labels[leg_index]} only.")
-            self.owner.status_var.set("Leg template preview running")
-        except Exception as exc:
-            self.messagebox.showerror("Preview selected leg", str(exc))
-
-    def run_all_legs(self) -> None:
-        try:
-            self.require_preview_ready()
-            self.owner.cancel_initial_position()
-            self.controller.start_leg_motion(self.current_design)
-            self.status_var.set("Running the template on all enabled legs.")
-            self.owner.status_var.set("Transferred leg gait running")
-        except Exception as exc:
-            self.messagebox.showerror("Run all legs", str(exc))
-
-    def stop_motion(self) -> None:
-        self.controller.stop_motion_neutral()
-        self.status_var.set("Stopped at configured neutral positions.")
-        self.owner.status_var.set("Stopped at configured neutral positions")
-
-    def new_design(self) -> None:
-        self.cancel_continuous_recording(show_status=False)
-        self.stop_motion()
-        self.current_design = default_leg_motion_design("New leg motion")
-        self.load_design_into_widgets()
-
-    def selected_saved_design(self) -> LegMotionDesign:
-        name = self.design_name_var.get().strip()
-        for design in self.designs:
-            if design.name == name:
-                return design
-        raise ValueError(f"Design not found: {name}")
-
-    def load_selected_design(self) -> None:
-        try:
-            self.cancel_continuous_recording(show_status=False)
-            self.stop_motion()
-            self.current_design = copy.deepcopy(self.selected_saved_design())
-            self.load_design_into_widgets()
-            self.status_var.set(f"Loaded '{self.current_design.name}'.")
-        except Exception as exc:
-            self.messagebox.showerror("Load leg motion design", str(exc))
-
-    def save_current_design(self) -> None:
-        try:
-            if self.design_load_error:
-                raise RuntimeError(
-                    f"Cannot overwrite an unreadable design file: {self.design_load_error}"
-                )
-            self.frequency_changed()
-            name = self.design_name_var.get().strip()
-            if not name:
-                raise ValueError("Enter a design name.")
-            self.current_design.name = name
-            validate_leg_motion_design(self.current_design)
-            existing_index = next(
-                (
-                    index
-                    for index, design in enumerate(self.designs)
-                    if design.name == name
-                ),
-                None,
-            )
-            if existing_index is not None:
-                if not self.messagebox.askyesno(
-                    "Overwrite leg motion design",
-                    f"Overwrite '{name}'?",
-                ):
-                    return
-                self.designs[existing_index] = copy.deepcopy(self.current_design)
-                action = "Updated"
-            else:
-                self.designs.append(copy.deepcopy(self.current_design))
-                action = "Saved"
-            save_leg_motion_designs(self.design_path, self.designs)
-            self.refresh_design_names()
-            self.status_var.set(f"{action} '{name}' in {self.design_path}")
-        except Exception as exc:
-            self.messagebox.showerror("Save leg motion design", str(exc))
-
-    def delete_selected_design(self) -> None:
-        try:
-            design = self.selected_saved_design()
-            if not self.messagebox.askyesno(
-                "Delete leg motion design",
-                f"Delete '{design.name}'?",
-            ):
-                return
-            self.designs = [item for item in self.designs if item.name != design.name]
-            save_leg_motion_designs(self.design_path, self.designs)
-            self.refresh_design_names()
-            self.current_design = default_leg_motion_design()
-            self.load_design_into_widgets()
-            self.status_var.set(f"Deleted '{design.name}'.")
-        except Exception as exc:
-            self.messagebox.showerror("Delete leg motion design", str(exc))
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        self.cancel_continuous_recording(show_status=False)
-        try:
-            self.controller.motion_enabled = False
-            if self.manual_torque_off:
-                self.controller.set_torque(False)
-        except Exception:
-            pass
-        if self.window.winfo_exists():
-            self.window.destroy()
 
 
 class MotionTeachingGui:
@@ -3721,6 +2510,8 @@ class MotionTeachingGui:
         config: RobotConfig,
         input_path: str,
         output_path: str,
+        owner=None,
+        bus: DynamixelBus | None = None,
     ) -> None:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
@@ -3729,17 +2520,28 @@ class MotionTeachingGui:
         self.ttk = ttk
         self.filedialog = filedialog
         self.messagebox = messagebox
-        self.root = tk.Tk()
+        # Opened from the CPG tuner it shares that window's bus and event loop;
+        # the serial port only admits one owner, so it cannot open its own.
+        self.owner = owner
+        self.owns_bus = bus is None
+        self.root = tk.Tk() if owner is None else tk.Toplevel(owner.root)
         self.root.title("Hanachan Motion Teaching")
         self.root.geometry("960x720")
         self.root.minsize(780, 580)
 
-        self.bus = DynamixelBus(device, baudrate, protocol)
+        self.bus = bus if bus is not None else DynamixelBus(device, baudrate, protocol)
         self.config = config
         self.servo_ids = [config.ids[index] for index in config.enabled_indices]
         self.sequence = MotionSequence(servo_ids=list(self.servo_ids), frames=[])
         self.input_path = input_path
         self.output_path = output_path
+        self.library_path = output_path or DEFAULT_MOTION_LIBRARY
+        try:
+            self.library = load_motion_library_or_legacy(self.library_path)
+        except Exception:
+            self.library = []  # surfaced when saving rather than blocking startup
+        self.motion_name_var = tk.StringVar()
+        self.motion_name_combo = None
         self.status_var = tk.StringVar(value="DYNAMIXELバスを開いています...")
         self.name_var = tk.StringVar()
         self.duration_var = tk.StringVar(value="1.0")
@@ -3750,12 +2552,14 @@ class MotionTeachingGui:
         self.playback_start_time = 0.0
         self.playback_start_positions: dict[int, int] = {}
         self.playing = False
+        self.loop_var = tk.BooleanVar(value=False)
         self.torque_enabled = False
         self.closed = False
 
     def run(self) -> None:
         try:
-            self.bus.__enter__()
+            if self.owns_bus:
+                self.bus.__enter__()
             found = self.bus.scan(sorted(set(self.servo_ids)))
             found_ids = {dxl_id for dxl_id, _model in found}
             missing = sorted(set(self.servo_ids) - found_ids)
@@ -3767,17 +2571,19 @@ class MotionTeachingGui:
                 self.load_sequence(self.input_path)
             self.build_widgets(found_ids)
             self.root.protocol("WM_DELETE_WINDOW", self.close)
-            self.root.mainloop()
+            if self.owns_bus:
+                self.root.mainloop()
         except Exception as exc:
             self.messagebox.showerror("Hanachan Motion Teaching", str(exc))
             try:
                 self.set_torque_off()
             except Exception:
                 pass
-            try:
-                self.bus.__exit__(None, None, None)
-            except Exception:
-                pass
+            if self.owns_bus:
+                try:
+                    self.bus.__exit__(None, None, None)
+                except Exception:
+                    pass
 
     def build_widgets(self, found_ids: set[int]) -> None:
         tk = self.tk
@@ -3849,6 +2655,11 @@ class MotionTeachingGui:
         ttk.Button(sequence_frame, text="削除", command=self.delete_selected).grid(
             row=1, column=3, padx=(6, 0), pady=(8, 0)
         )
+        ttk.Checkbutton(
+            sequence_frame,
+            text="繰り返し再生",
+            variable=self.loop_var,
+        ).grid(row=3, column=4, sticky="w", padx=(12, 0))
         ttk.Button(sequence_frame, text="シーケンス再生", command=self.play_sequence).grid(
             row=1, column=6, padx=(18, 0), pady=(8, 0)
         )
@@ -3862,15 +2673,30 @@ class MotionTeachingGui:
             fill=tk.X
         )
 
+        library = ttk.LabelFrame(outer, text="モーション一覧", padding=8)
+        library.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(library, text="名前").pack(side=tk.LEFT)
+        self.motion_name_combo = ttk.Combobox(
+            library,
+            textvariable=self.motion_name_var,
+            values=[motion.name for motion in self.library],
+            width=28,
+        )
+        self.motion_name_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+        ttk.Button(library, text="読込", command=self.load_named_motion).pack(side=tk.LEFT)
+        ttk.Button(library, text="保存", command=self.save_named_motion).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(library, text="削除", command=self.delete_named_motion).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Label(library, text=f"→ {self.library_path}").pack(side=tk.LEFT, padx=(12, 0))
+
         footer = ttk.Frame(outer)
         footer.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(footer, textvariable=self.status_var).pack(side=tk.LEFT)
-        ttk.Button(footer, text="読込...", command=self.load_from_dialog).pack(side=tk.RIGHT)
-        ttk.Button(footer, text="別名で保存...", command=self.save_as).pack(
-            side=tk.RIGHT, padx=(0, 6)
-        )
-        ttk.Button(footer, text="保存", command=self.save_sequence).pack(
-            side=tk.RIGHT, padx=(0, 6)
+        ttk.Button(footer, text="ファイルから読込...", command=self.load_from_dialog).pack(
+            side=tk.RIGHT
         )
         self.refresh_tree()
         self.status_var.set("トルクOFF。関節を手で動かして現在姿勢を追加してください。")
@@ -4014,24 +2840,71 @@ class MotionTeachingGui:
         )
         self.detail_var.set(values)
 
-    def save_sequence(self) -> None:
-        try:
-            save_motion_sequence(self.output_path, self.sequence)
-            self.status_var.set(f"保存しました: {self.output_path}")
-        except Exception as exc:
-            self.messagebox.showerror("シーケンス保存", str(exc))
+    def refresh_motion_names(self, selected: str | None = None) -> None:
+        if self.motion_name_combo is not None:
+            self.motion_name_combo.configure(
+                values=[motion.name for motion in self.library]
+            )
+        if selected is not None:
+            self.motion_name_var.set(selected)
 
-    def save_as(self) -> None:
-        path = self.filedialog.asksaveasfilename(
-            title="モーションシーケンスを保存",
-            defaultextension=".json",
-            filetypes=(("JSON", "*.json"), ("All files", "*.*")),
-            initialfile=self.output_path,
-        )
-        if not path:
-            return
-        self.output_path = path
-        self.save_sequence()
+    def save_named_motion(self) -> None:
+        try:
+            name = self.motion_name_var.get().strip()
+            if not name:
+                raise ValueError("モーション名を入力してください")
+            if not self.sequence.frames:
+                raise ValueError("姿勢を1つ以上取り込んでください")
+            self.sequence.name = name
+            validate_motion_sequence(self.sequence, expected_ids=self.servo_ids)
+            existing = next(
+                (i for i, m in enumerate(self.library) if m.name == name), None
+            )
+            if existing is not None:
+                if not self.messagebox.askyesno(
+                    "モーション保存", f"'{name}' を上書きしますか？"
+                ):
+                    return
+                self.library[existing] = copy.deepcopy(self.sequence)
+                action = "更新"
+            else:
+                self.library.append(copy.deepcopy(self.sequence))
+                action = "保存"
+            save_motion_library(self.library_path, self.library)
+            self.refresh_motion_names(name)
+            self.status_var.set(f"{action}しました: {name} ({self.library_path})")
+        except Exception as exc:
+            self.messagebox.showerror("モーション保存", str(exc))
+
+    def load_named_motion(self) -> None:
+        try:
+            self.require_teaching_state()
+            name = self.motion_name_var.get().strip()
+            motion = next((m for m in self.library if m.name == name), None)
+            if motion is None:
+                raise ValueError(f"モーションが見つかりません: {name}")
+            validate_motion_sequence(motion, expected_ids=self.servo_ids)
+            self.sequence = copy.deepcopy(motion)
+            self.refresh_tree(0 if self.sequence.frames else None)
+            self.status_var.set(f"読み込みました: {name}")
+        except Exception as exc:
+            self.messagebox.showerror("モーション読込", str(exc))
+
+    def delete_named_motion(self) -> None:
+        try:
+            name = self.motion_name_var.get().strip()
+            motion = next((m for m in self.library if m.name == name), None)
+            if motion is None:
+                raise ValueError(f"モーションが見つかりません: {name}")
+            if not self.messagebox.askyesno("モーション削除", f"'{name}' を削除しますか？"):
+                return
+            self.library = [m for m in self.library if m.name != name]
+            save_motion_library(self.library_path, self.library)
+            self.motion_name_var.set("")
+            self.refresh_motion_names()
+            self.status_var.set(f"削除しました: {name}")
+        except Exception as exc:
+            self.messagebox.showerror("モーション削除", str(exc))
 
     def load_from_dialog(self) -> None:
         try:
@@ -4040,16 +2913,45 @@ class MotionTeachingGui:
             self.messagebox.showerror("シーケンス読込", str(exc))
             return
         path = self.filedialog.askopenfilename(
-            title="モーションシーケンスを開く",
+            title="モーションファイルを開く",
             filetypes=(("JSON", "*.json"), ("All files", "*.*")),
         )
-        if path:
-            try:
-                self.load_sequence(path)
+        if not path:
+            return
+        try:
+            # Accepts both shapes: a library of named motions, and a file from
+            # before motions had names, which carries exactly one.
+            motions = load_motion_library(path)
+            if not motions:
+                raise ValueError("モーションが入っていません")
+            for motion in motions:
+                validate_motion_sequence(motion, expected_ids=self.servo_ids)
+
+            if len(motions) == 1:
+                self.sequence = copy.deepcopy(motions[0])
                 self.refresh_tree(0 if self.sequence.frames else None)
-                self.status_var.set(f"読み込みました: {path}")
-            except Exception as exc:
-                self.messagebox.showerror("シーケンス読込", str(exc))
+                self.motion_name_var.set(self.sequence.name)
+                self.status_var.set(
+                    f"読み込みました: {self.sequence.name}"
+                    f"（{len(self.sequence.frames)}姿勢）。保存で一覧に追加されます。"
+                )
+                return
+
+            added = 0
+            for motion in motions:
+                if any(existing.name == motion.name for existing in self.library):
+                    continue
+                self.library.append(copy.deepcopy(motion))
+                added += 1
+            save_motion_library(self.library_path, self.library)
+            self.sequence = copy.deepcopy(motions[0])
+            self.refresh_tree(0 if self.sequence.frames else None)
+            self.refresh_motion_names(self.sequence.name)
+            self.status_var.set(
+                f"{len(motions)}件を読み込み、{added}件を一覧へ追加しました。"
+            )
+        except Exception as exc:
+            self.messagebox.showerror("モーション読込", str(exc))
 
     def load_sequence(self, path: str) -> None:
         sequence = load_motion_sequence(path)
@@ -4107,8 +3009,11 @@ class MotionTeachingGui:
         if not self.playing:
             return
         if self.playback_index >= len(self.sequence.frames):
-            self.finish_playback("再生完了。トルクOFFに戻しました。")
-            return
+            if self.loop_var.get():
+                self.playback_index = 0
+            else:
+                self.finish_playback("再生完了。トルクOFFに戻しました。")
+                return
         frame = self.sequence.frames[self.playback_index]
         self.playback_start_time = time.monotonic()
         self.status_var.set(
@@ -4165,7 +3070,8 @@ class MotionTeachingGui:
             self.set_torque_off()
         except Exception:
             pass
-        self.bus.__exit__(None, None, None)
+        if self.owns_bus:
+            self.bus.__exit__(None, None, None)
         self.root.destroy()
 
 
@@ -4812,7 +3718,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     teach.add_argument(
         "--output",
-        default="motion_sequence.json",
+        default=DEFAULT_MOTION_LIBRARY,
         help="motion sequence JSON written by the Save button",
     )
 
@@ -4847,6 +3753,34 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         add_cpg_gui_args(subparsers.add_parser(command, help=model_help))
 
+    serve = subparsers.add_parser(
+        "serve",
+        help="run the robot from a phone browser over the local network",
+    )
+    add_robot_config_args(serve)
+    serve.add_argument("--host", default="0.0.0.0", help="interface to listen on")
+    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument(
+        "--preset-file",
+        default="gait_presets.json",
+        help="named gait preset JSON offered as walking motions",
+    )
+    serve.add_argument(
+        "--motion-file",
+        default=DEFAULT_MOTION_LIBRARY,
+        help="motion library JSON offering the recorded motions",
+    )
+    serve.add_argument(
+        "--control-hz",
+        type=float,
+        help="control frequency; defaults to 10 Hz at wireless baudrates and 50 Hz otherwise",
+    )
+    serve.add_argument(
+        "--torque-off-exit",
+        action="store_true",
+        help="disable torque when the server stops",
+    )
+
     return parser
 
 
@@ -4861,11 +3795,6 @@ def add_cpg_gui_args(cpg_gui: argparse.ArgumentParser) -> None:
         "--preset-file",
         default="gait_presets.json",
         help="named gait preset JSON loaded and saved by the GUI",
-    )
-    cpg_gui.add_argument(
-        "--leg-design-file",
-        default="leg_motion_designs.json",
-        help="single-leg keyframes and per-leg phase offsets used by Leg Motion Designer",
     )
     cpg_gui.add_argument(
         "--initial-preset",
@@ -4956,6 +3885,563 @@ def build_robot_config_from_args(
         direction_overrides=args.direction_overrides,
         gait_model=gait_model,
     )
+
+
+# Phone control parameters. Only these are exposed: the rest of a gait is
+# tuned at the desk in cpg-gui and saved as a preset.
+PHONE_GAIT_PARAMS = {
+    "frequency": 0,
+    "turn": 9,
+    "body_wave": 12,
+    "body_turn": 14,
+}
+
+# Steering controls are centred, and a phone slider cannot reliably be put back
+# on exactly zero. Anything inside this band is treated as straight ahead;
+# without it the robot curves away on a slider left a hundredth off centre.
+PHONE_CENTRED_PARAMS = {"turn", "body_turn"}
+PHONE_CENTRE_DEADZONE = 0.06
+
+
+class RobotControlService:
+    """Owns the bus and runs the control loop so several clients can steer it.
+
+    The radio drops out from time to time, so a failed write must not end the
+    run: failures are counted and reported instead, and the loop keeps going.
+    """
+
+    MAX_CONSECUTIVE_ERRORS = 25
+
+    def __init__(
+        self,
+        bus: DynamixelBus,
+        config: RobotConfig,
+        control_period: float,
+        preset_path: str,
+        motion_library_path: str,
+        gait_model: str = "v2",
+    ) -> None:
+        self.bus = bus
+        self.config = config
+        self.control_period = control_period
+        self.gait_model = gait_model
+        self.controller = HanachanCPGController(bus, config, gait_model)
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+
+        self.gaits = [
+            preset
+            for preset in load_gait_presets(preset_path)
+            if preset.gait_model == gait_model
+        ]
+        self.motions = {m.name: m for m in load_motion_library_or_legacy(motion_library_path)}
+        self.player: MotionSequencePlayer | None = None
+        self.selected_motion: MotionSequence | None = None
+        self.motion_speed = 1.0
+
+        self.selected_kind: str | None = None
+        self.selected_name: str | None = None
+        self.status = "idle"
+        self.error_text = ""
+        self.write_errors = 0
+        self.consecutive_errors = 0
+        self.ticks = 0
+
+        self.pose_targets: dict[int, int] | None = None
+        self.pose_start: dict[int, int] | None = None
+        self.pose_started_at = 0.0
+
+        self.thread = threading.Thread(target=self.control_loop, daemon=True)
+
+    # ---- lifecycle ----
+
+    def start(self) -> None:
+        with self.lock:
+            self.controller.initialize_servos(set_position_mode=True)
+            self.controller.configure_profile(self.control_period)
+            self.status = "ready"
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+    # ---- control loop ----
+
+    def control_loop(self) -> None:
+        last = time.monotonic()
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            dt = started - last
+            last = started
+            try:
+                with self.lock:
+                    if self.pose_targets is not None:
+                        self.step_initial_pose()
+                    elif self.player is not None:
+                        targets = self.player.step(dt * self.motion_speed)
+                        if targets is None:
+                            self.player = None
+                            self.status = "finished"
+                        else:
+                            self.bus.sync_move_to(targets)
+                    else:
+                        self.controller.update(dt, self.control_period)
+                    self.ticks += 1
+                    self.consecutive_errors = 0
+            except Exception as exc:
+                self.write_errors += 1
+                self.consecutive_errors += 1
+                self.error_text = str(exc)
+                if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                    with self.lock:
+                        self.controller.motion_enabled = False
+                        self.pose_targets = None
+                        self.status = "link lost"
+            time.sleep(max(0.0, self.control_period - (time.monotonic() - started)))
+
+    def step_initial_pose(self) -> None:
+        assert self.pose_targets is not None and self.pose_start is not None
+        elapsed = time.monotonic() - self.pose_started_at
+        ratio = min(1.0, elapsed / INITIAL_POSITION_DURATION_SECONDS)
+        self.bus.sync_move_to(
+            interpolate_positions(self.pose_start, self.pose_targets, ratio)
+        )
+        if ratio >= 1.0:
+            self.pose_targets = None
+            self.pose_start = None
+            self.status = "neutral"
+
+    # ---- commands ----
+
+    def reset_pose(self) -> None:
+        with self.lock:
+            self.player = None
+            self.controller.motion_enabled = False
+            self.controller.clear_body_tick_overrides()
+            self.pose_start = self.controller.read_current_positions()
+            self.pose_targets = self.controller.neutral_targets()
+            self.pose_started_at = time.monotonic()
+            self.status = "moving to neutral"
+
+    def stop(self) -> None:
+        with self.lock:
+            self.pose_targets = None
+            self.player = None
+            self.controller.stop_motion_neutral()
+            self.status = "stopped"
+
+    def select(self, kind: str, name: str) -> None:
+        """Load a gait or motion without moving. Starting is a separate press.
+
+        Scrolling a picker should never make the robot walk off, so selecting
+        only arms the choice and the parameters it carries.
+        """
+        with self.lock:
+            self.pose_targets = None
+            self.player = None
+            self.controller.motion_enabled = False
+            if kind == "gait":
+                preset = next((p for p in self.gaits if p.name == name), None)
+                if preset is None:
+                    raise ValueError(f"unknown gait: {name}")
+                self.config.params_for(self.gait_model)[:] = preset.gait_params
+                self.config.reverse_legs = preset.reverse_legs
+                self.config.sweep_phase_offset_rad = preset.sweep_phase_offset_rad
+                self.controller.motion_source = "cpg"
+                self.selected_motion = None
+            elif kind == "motion":
+                sequence = self.motions.get(name)
+                if sequence is None:
+                    raise ValueError(f"unknown motion: {name}")
+                validate_motion_sequence(sequence)
+                self.selected_motion = sequence
+            else:
+                raise ValueError(f"unknown motion kind: {kind}")
+            self.selected_kind = kind
+            self.selected_name = name
+            self.status = "ready"
+
+    def run_selected(self) -> None:
+        """Run the armed choice: a gait walks until stopped, a motion plays once."""
+        with self.lock:
+            if self.selected_kind is None:
+                raise ValueError("select a gait or a motion first")
+            self.pose_targets = None
+            if self.selected_kind == "gait":
+                self.player = None
+                self.controller.motion_source = "cpg"
+                self.controller.start_motion()
+                self.status = "walking"
+                return
+            if self.selected_motion is None:
+                raise ValueError("select a motion first")
+            self.controller.motion_enabled = False
+            player = MotionSequencePlayer(self.selected_motion, loop=False)
+            player.begin(
+                {
+                    dxl_id: self.bus.read_position(dxl_id)
+                    for dxl_id in self.selected_motion.servo_ids
+                }
+            )
+            self.player = player
+            self.status = "playing"
+
+    def set_param(self, name: str, value: float) -> None:
+        with self.lock:
+            if self.selected_kind == "motion":
+                if name != "speed":
+                    raise ValueError("a recorded motion only exposes speed")
+                self.motion_speed = max(0.2, min(3.0, float(value)))
+                return
+            if name not in PHONE_GAIT_PARAMS:
+                raise ValueError(f"unknown parameter: {name}")
+            index = PHONE_GAIT_PARAMS[name]
+            value = float(value)
+            if name in PHONE_CENTRED_PARAMS and abs(value) < PHONE_CENTRE_DEADZONE:
+                value = 0.0
+            self.controller.gait_params[index] = clip_unit(value)
+
+    def state(self) -> dict:
+        with self.lock:
+            params = {}
+            if self.selected_kind == "motion":
+                params["speed"] = {
+                    "value": self.motion_speed,
+                    "physical": f"{self.motion_speed:.2f}x",
+                    "label": "Speed",
+                    "min": 0.2,
+                    "max": 3.0,
+                    "centred": False,
+                    "deadzone": 0.0,
+                }
+            else:
+                specs = GAIT_MODELS[self.gait_model].specs
+                for name, index in PHONE_GAIT_PARAMS.items():
+                    label, unit, low, high = specs[index]
+                    value = self.controller.gait_params[index]
+                    physical = map_range(value, low, high)
+                    params[name] = {
+                        "value": value,
+                        "physical": f"{physical:.3f}{(' ' + unit) if unit else ''}",
+                        "label": label,
+                        "min": -1.0,
+                        "max": 1.0,
+                        "centred": name in PHONE_CENTRED_PARAMS,
+                        "deadzone": PHONE_CENTRE_DEADZONE,
+                    }
+            return {
+                "status": self.status,
+                "kind": self.selected_kind,
+                "name": self.selected_name,
+                "running": self.controller.motion_enabled or self.player is not None,
+                "params": params,
+                "link": {
+                    "ticks": self.ticks,
+                    "errors": self.write_errors,
+                    "consecutive": self.consecutive_errors,
+                    "hz": round(1.0 / self.control_period, 1),
+                    "last_error": self.error_text,
+                },
+                "motions": {
+                    "gait": [preset.name for preset in self.gaits],
+                    "motion": sorted(self.motions),
+                },
+            }
+
+
+PHONE_UI_HTML = """<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Hanachan</title>
+<style>
+:root{color-scheme:dark}
+body{margin:0;padding:12px;background:#14161a;color:#e8eaed;
+ font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+h1{font-size:18px;margin:0 0 10px}
+.card{background:#1e2127;border-radius:12px;padding:12px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{flex:1;min-width:96px;min-height:56px;font-size:16px;font-weight:600;
+ border:0;border-radius:10px;background:#2f855a;color:#fff}
+button.grey{background:#3a3f4b}
+button.red{background:#9b2c2c}
+button:active{filter:brightness(1.3)}
+select{width:100%;min-height:48px;font-size:16px;background:#2a2e37;color:#e8eaed;
+ border:1px solid #3a3f4b;border-radius:8px;padding:0 8px}
+label{display:block;margin:14px 0 4px;font-size:14px;color:#a8b0bd}
+button.zero{flex:0 0 auto;min-width:44px;min-height:32px;font-size:13px;
+ margin-left:8px;border-radius:6px;vertical-align:middle}
+input[type=range]{width:100%;height:40px}
+.val{float:right;color:#e8eaed;font-variant-numeric:tabular-nums}
+.status{font-size:14px;color:#a8b0bd}
+.bad{color:#f56565}
+.tabs{display:flex;gap:8px;margin-bottom:8px}
+.tabs button{min-height:44px;background:#3a3f4b}
+.tabs button.on{background:#2b6cb0}
+</style></head><body>
+<h1>Hanachan controller</h1>
+
+<div class="card">
+  <div class="row">
+    <button class="grey" onclick="post('/api/reset')">初期姿勢</button>
+    <button class="red" onclick="post('/api/stop')">停止</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="tabs">
+    <button id="tab-gait" class="on" onclick="setKind('gait')">歩容</button>
+    <button id="tab-motion" onclick="setKind('motion')">モーション</button>
+  </div>
+  <select id="motion" onchange="select()"></select>
+  <div class="row" style="margin-top:10px">
+    <button id="start" onclick="post('/api/start')">走行</button>
+  </div>
+</div>
+
+<div class="card" id="params"></div>
+
+<div class="card status" id="status">接続中...</div>
+
+<script>
+let kind = 'gait';
+let motions = {gait: [], motion: []};
+let dragging = false;
+
+async function post(url, body) {
+  try {
+    const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {})});
+    if (!r.ok) console.warn(await r.text());
+  } catch (e) { console.warn(e); }
+  refresh();
+}
+
+function setKind(k) {
+  kind = k;
+  document.getElementById('tab-gait').className = k === 'gait' ? 'on' : '';
+  document.getElementById('tab-motion').className = k === 'motion' ? 'on' : '';
+  // A gait keeps walking until stopped; a motion is played once.
+  document.getElementById('start').textContent = k === 'gait' ? '走行' : '再生';
+  fillMotions();
+}
+
+function fillMotions() {
+  const sel = document.getElementById('motion');
+  sel.innerHTML = '';
+  for (const name of motions[kind] || []) {
+    const o = document.createElement('option');
+    o.value = name; o.textContent = name; sel.appendChild(o);
+  }
+}
+
+function select() {
+  const name = document.getElementById('motion').value;
+  if (name) post('/api/select', {kind: kind, name: name});
+}
+
+function renderParams(params) {
+  const box = document.getElementById('params');
+  const wanted = Object.keys(params).join(',');
+  if (box.dataset.keys !== wanted) {
+    box.dataset.keys = wanted;
+    box.innerHTML = '';
+    for (const [name, p] of Object.entries(params)) {
+      const label = document.createElement('label');
+      label.textContent = p.label || name;
+      if (p.centred) {
+        const zero = document.createElement('button');
+        zero.textContent = '0';
+        zero.className = 'grey zero';
+        zero.onclick = () => post('/api/param', {name: name, value: 0});
+        label.appendChild(zero);
+      }
+      const span = document.createElement('span');
+      span.className = 'val'; span.id = 'v-' + name;
+      label.appendChild(span);
+      const input = document.createElement('input');
+      input.type = 'range'; input.id = 'p-' + name;
+      input.min = p.min; input.max = p.max; input.step = 0.01;
+      input.oninput = () => {
+        dragging = true;
+        // Snap under the thumb, so centring is something you can feel.
+        if (p.centred && Math.abs(parseFloat(input.value)) < p.deadzone) input.value = 0;
+      };
+      input.onchange = () => { dragging = false; post('/api/param', {name: name, value: parseFloat(input.value)}); };
+      box.appendChild(label); box.appendChild(input);
+    }
+  }
+  for (const [name, p] of Object.entries(params)) {
+    const input = document.getElementById('p-' + name);
+    if (input && !dragging) input.value = p.value;
+    const span = document.getElementById('v-' + name);
+    if (span) span.textContent = p.physical;
+  }
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/state')).json();
+    motions = s.motions;
+    if (document.getElementById('motion').options.length !== (motions[kind] || []).length) fillMotions();
+    if (s.name && s.kind === kind) document.getElementById('motion').value = s.name;
+    renderParams(s.params);
+    const link = s.link;
+    const bad = link.consecutive > 0;
+    document.getElementById('status').innerHTML =
+      `<span class="${bad ? 'bad' : ''}">${s.status}</span> &middot; ${s.name || '-'} &middot; ` +
+      `${link.hz} Hz &middot; ticks ${link.ticks} &middot; ` +
+      `<span class="${link.errors ? 'bad' : ''}">errors ${link.errors}</span>` +
+      (link.last_error ? `<br><span class="bad">${link.last_error}</span>` : '');
+  } catch (e) {
+    document.getElementById('status').innerHTML = '<span class="bad">サーバーに接続できません</span>';
+  }
+}
+setInterval(refresh, 700);
+refresh();
+</script></body></html>
+"""
+
+
+def make_control_request_handler(service: RobotControlService):
+    from http.server import BaseHTTPRequestHandler
+
+    class ControlRequestHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            pass  # the control loop owns the console
+
+        def reply(self, status: int, payload: dict | None = None, html: str | None = None):
+            if html is not None:
+                body = html.encode("utf-8")
+                content_type = "text/html; charset=utf-8"
+            else:
+                body = json.dumps(payload or {}).encode("utf-8")
+                content_type = "application/json"
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self.reply(200, html=PHONE_UI_HTML)
+            elif self.path == "/api/state":
+                self.reply(200, service.state())
+            else:
+                self.reply(404, {"error": "not found"})
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self.reply(400, {"error": "invalid JSON"})
+                return
+            try:
+                if self.path == "/api/reset":
+                    service.reset_pose()
+                elif self.path == "/api/stop":
+                    service.stop()
+                elif self.path == "/api/select":
+                    service.select(payload["kind"], payload["name"])
+                elif self.path == "/api/start":
+                    service.run_selected()
+                elif self.path == "/api/param":
+                    service.set_param(payload["name"], payload["value"])
+                else:
+                    self.reply(404, {"error": "not found"})
+                    return
+            except Exception as exc:
+                self.reply(400, {"error": str(exc)})
+                return
+            self.reply(200, service.state())
+
+    return ControlRequestHandler
+
+
+def tailscale_address() -> str | None:
+    """Campus networks usually isolate clients, so the tailnet is the way in."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in result.stdout.splitlines():
+        address = line.strip()
+        if address:
+            return address
+    return None
+
+
+def local_addresses() -> list[str]:
+    import socket
+
+    addresses = set()
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))  # no traffic; just picks the outbound NIC
+        addresses.add(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    return sorted(addresses)
+
+
+def run_server(args: argparse.Namespace, device: str) -> None:
+    from http.server import ThreadingHTTPServer
+
+    config = build_robot_config_from_args(args, "v2")
+    control_period = resolve_control_period(args.baudrate, args.control_hz)
+
+    with DynamixelBus(device, args.baudrate, args.protocol) as bus:
+        service = RobotControlService(
+            bus=bus,
+            config=config,
+            control_period=control_period,
+            preset_path=args.preset_file,
+            motion_library_path=args.motion_file,
+        )
+        print(f"initializing servos on {device} ...")
+        service.start()
+        print(
+            f"gaits: {[p.name for p in service.gaits] or '(none)'}\n"
+            f"motions: {sorted(service.motions) or '(none)'}"
+        )
+
+        handler = make_control_request_handler(service)
+        server = ThreadingHTTPServer((args.host, args.port), handler)
+        tailnet = tailscale_address()
+        if tailnet:
+            print(f"open on your phone:  http://{tailnet}:{args.port}/   (tailnet)")
+        for address in local_addresses():
+            print(f"                     http://{address}:{args.port}/   (local network)")
+        if not tailnet:
+            print("tailscale address not found; only the local network will work")
+        print(f"control rate {1.0 / control_period:.1f} Hz. Ctrl-C to stop.")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopping ...")
+        finally:
+            server.server_close()
+            try:
+                service.stop()
+            except Exception:
+                pass
+            service.close()
+            if args.torque_off_exit:
+                service.controller.set_torque(False)
 
 
 def run_cpg(args: argparse.Namespace, device: str) -> None:
@@ -5061,6 +4547,10 @@ def run(args: argparse.Namespace) -> None:
         run_cpg(args, device)
         return
 
+    if args.command == "serve":
+        run_server(args, device)
+        return
+
     if args.command in ("cpg-gui", "cpg-gui-v2"):
         gait_model = "v2" if args.command == "cpg-gui-v2" else "v1"
         model = GAIT_MODELS[gait_model]
@@ -5078,7 +4568,6 @@ def run(args: argparse.Namespace) -> None:
             config=config,
             output_path=args.output,
             preset_path=args.preset_file,
-            leg_design_path=args.leg_design_file,
             skip_init=args.skip_init,
             skip_position_mode=args.skip_position_mode,
             torque_on=args.torque_on,
